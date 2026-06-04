@@ -1,0 +1,553 @@
+# yaml-language-server: $schema=schema/taxonomy.schema.json
+# Taxonomy of kernel hardening mechanisms.
+# Extracted from os-hardening-research-spec.md §3–4.
+# Read-only reference data — scores live in per-OS evaluation-*.yaml files.
+schema_version: 1
+
+# ---------------------------------------------------------------------------
+# Dimension weight profiles (spec §4.4)
+# H(M) = P × (w_d·D + w_s·S + w_a·A + w_t·T)
+# ---------------------------------------------------------------------------
+dimension_weights:
+  balanced: {w_d: 0.25, w_s: 0.35, w_a: 0.25, w_t: 0.15}
+  security_first: {w_d: 0.20, w_s: 0.45, w_a: 0.25, w_t: 0.10}
+  pragmatic: {w_d: 0.30, w_s: 0.25, w_a: 0.15, w_t: 0.30}
+  architectural: {w_d: 0.15, w_s: 0.25, w_a: 0.45, w_t: 0.15}
+
+# ---------------------------------------------------------------------------
+# Category weights per threat model (spec §4.5)
+# Base weights are renormalized over applicable categories per OS:
+# H_total(OS) = Σ (W'_k(OS) × H(C_k)), W'_k = W_k / Σ W_j for j in K_OS
+# ---------------------------------------------------------------------------
+category_weights:
+  general_purpose_server:
+    C1: 0.20
+    C2: 0.15
+    C3: 0.15
+    C4: 0.20
+    C5: 0.10
+    C6: 0.10
+    C7: 0.10
+  high_security:
+    C1: 0.20
+    C2: 0.20
+    C3: 0.15
+    C4: 0.15
+    C5: 0.15
+    C6: 0.10
+    C7: 0.05
+  embedded_iot:
+    C1: 0.15
+    C2: 0.10
+    C3: 0.10
+    C4: 0.15
+    C5: 0.25
+    C6: 0.15
+    C7: 0.10
+
+# ---------------------------------------------------------------------------
+# Target operating systems (spec §2)
+# ---------------------------------------------------------------------------
+operating_systems:
+  linux:
+    name: "Linux"
+    version: "7.0.10 · aarch64"
+    kernel_type: monolithic
+    repo_url: "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+    clone_args:
+    companion_repos:
+      linux_history:
+        repo_url: "https://git.kernel.org/pub/scm/linux/kernel/git/history/history.git"
+        purpose: "BitKeeper-era pre-1da177e4c3f4 history (1991-2005); resolves SHAs older than 2.6.12-rc2 cited in C1e.2 NX et al."
+  netbsd:
+    name: "NetBSD"
+    version: "10.1 · aarch64"
+    kernel_type: monolithic
+    repo_url: "https://github.com/NetBSD/src.git"
+    clone_args: "--branch netbsd-10"
+  fuchsia:
+    name: "Fuchsia"
+    version: "F28 · aarch64"
+    kernel_type: microkernel
+    repo_url: "https://fuchsia.googlesource.com/fuchsia"
+    clone_args: "--filter=blob:none --sparse"
+    sparse_paths: ["zircon/"]
+  hurd:
+    name: "GNU/Hurd"
+    version: "GNU Mach master / Debian GNU/Hurd 2025 (amd64 + i386)"
+    kernel_type: microkernel
+    repo_url: "https://git.savannah.gnu.org/git/hurd/gnumach.git"
+    clone_args:
+    companion_repos:
+      hurd_servers:
+        repo_url: "https://git.savannah.gnu.org/git/hurd/hurd.git"
+        purpose: "Hurd servers (auth, proc, exec, fs/*) — user-space half of the kernel that resolves cited commits outside gnumach"
+      hurd_mig:
+        repo_url: "https://git.savannah.gnu.org/git/hurd/mig.git"
+        purpose: "MIG IDL compiler used to generate gnumach RPC stubs"
+  redox:
+    name: "Redox OS"
+    version: "0.9.0 / kernel master (2026) · aarch64"
+    kernel_type: microkernel
+    repo_url: "https://gitlab.redox-os.org/redox-os/kernel.git"
+    clone_args:
+  freertos:
+    name: "FreeRTOS"
+    version: "Kernel V11.2.0 (2025-04)"
+    kernel_type: microkernel
+    family: FreeRTOS
+    repo_url: "https://github.com/FreeRTOS/FreeRTOS-Kernel"
+    clone_args: "--branch V11.2.0"
+  zephyr:
+    name: "Zephyr RTOS"
+    version: "v4.x main (2026)"
+    kernel_type: monolithic
+    family: Zephyr
+    repo_url: "https://github.com/zephyrproject-rtos/zephyr"
+    clone_args: "--depth=1"
+  tock:
+    name: "Tock OS"
+    version: "master @ aa1281a (2026-05)"
+    kernel_type: monolithic
+    family: Tock
+    repo_url: "https://github.com/tock/tock"
+    clone_args: "--depth=1"
+mechanisms:
+
+  # =========================================================================
+  # C1 — Memory Corruption Prevention (26 mechanisms)
+  # =========================================================================
+
+  # --- C1a — Spatial Safety (7) ---
+
+  C1a.1:
+    category: C1
+    subcategory: C1a
+    name: "Stack buffer overflow detection"
+    vulnerability_class: "CWE-121"
+  C1a.2:
+    category: C1
+    subcategory: C1a
+    name: "Guard pages (stack / heap)"
+    vulnerability_class: "CWE-121, CWE-122"
+  C1a.3:
+    category: C1
+    subcategory: C1a
+    name: "Hardened user-kernel copy"
+    vulnerability_class: "CWE-120"
+  C1a.4:
+    category: C1
+    subcategory: C1a
+    name: "Compile-time buffer overflow detection (FORTIFY_SOURCE)"
+    vulnerability_class: "CWE-120"
+  C1a.5:
+    category: C1
+    subcategory: C1a
+    name: "Runtime memory-safety sanitizers and bounds checking"
+    vulnerability_class: "CWE-787, CWE-125, CWE-416"
+  C1a.6:
+    category: C1
+    subcategory: C1a
+    name: "Hardware memory tagging (spatial mode)"
+    vulnerability_class: "CWE-787"
+  C1a.7:
+    category: C1
+    subcategory: C1a
+    name: "Array index bounds checking (UBSAN_BOUNDS)"
+    vulnerability_class: "CWE-129, CWE-787"
+  C1b.1:
+    category: C1
+    subcategory: C1b
+    name: "Use-after-free mitigation (allocator-level)"
+    vulnerability_class: "CWE-416"
+  C1b.2:
+    category: C1
+    subcategory: C1b
+    name: "Heap metadata and allocator hardening"
+    vulnerability_class: "CWE-122"
+    scoring_notes: >-
+      Cross-OS precedent: type-segregated slab caches with in-band but typed
+      free-lists score P=1 D=2 S=1 (FreeBSD "inherent slab architecture";
+      gnumach matches); a single undifferentiated heap with an intrusive
+      in-band free-list and no segregation scores P=0 (Redox). S=2 requires
+      actual free-list hardening — obfuscation, canaries or poisoning
+      (Linux/NetBSD/OpenBSD).
+  C1b.3:
+    category: C1
+    subcategory: C1b
+    name: "Reference count overflow protection"
+    vulnerability_class: "CWE-190, CWE-416"
+    scoring_notes: >-
+      Cross-OS precedent: an unconditional overflow check on a real
+      attacker-reachable refcount scores P=1 D=3 even when coverage is narrow
+      (Linux refcount_t, FreeBSD refcount(9) saturation). S grades on coverage
+      breadth: S=2 for pervasive checked types, S=1 for a narrow guard on one
+      counter family (OpenBSD debug assertions, Hurd MACH_PORT_UREFS_OVERFLOW).
+  C1b.4:
+    category: C1
+    subcategory: C1b
+    name: "Linked list integrity hardening"
+    vulnerability_class: "CWE-416"
+  C1b.5:
+    category: C1
+    subcategory: C1b
+    name: "Hardware memory tagging (temporal mode)"
+    vulnerability_class: "CWE-416"
+  C1c.1:
+    category: C1
+    subcategory: C1c
+    name: "Automatic variable initialization"
+    vulnerability_class: "CWE-457"
+  C1c.2:
+    category: C1
+    subcategory: C1c
+    name: "Heap zeroing on allocation"
+    vulnerability_class: "CWE-908"
+  C1d.1:
+    category: C1
+    subcategory: C1d
+    name: "Kernel stack randomization"
+    vulnerability_class: "stack address prediction"
+  C1d.2:
+    category: C1
+    subcategory: C1d
+    name: "Heap layout and allocation-order randomization"
+    vulnerability_class: "heap layout prediction"
+  C1d.3:
+    category: C1
+    subcategory: C1d
+    name: "Randomized structure layout"
+    vulnerability_class: "known struct member offsets"
+  C1e.1:
+    category: C1
+    subcategory: C1e
+    name: "W^X / DEP / NX enforcement in kernel space"
+    vulnerability_class: "CWE-94"
+  C1e.2:
+    category: C1
+    subcategory: C1e
+    name: "Read-only after init (__ro_after_init)"
+    vulnerability_class: "post-boot data modification"
+  C1e.3:
+    category: C1
+    subcategory: C1e
+    name: "Immutable memory regions"
+    vulnerability_class: "runtime kernel data modification"
+  C1e.4:
+    category: C1
+    subcategory: C1e
+    name: "Kernel execute-never for userspace mappings (SMEP/PXN)"
+    vulnerability_class: "CWE-269 (ret2usr)"
+  C1e.5:
+    category: C1
+    subcategory: C1e
+    name: "Sensitive control-metadata isolation"
+    vulnerability_class: "control metadata corruption"
+  C1e.6:
+    category: C1
+    subcategory: C1e
+    name: "Execute-only memory (xonly) for code segments"
+    vulnerability_class: "ROP gadget enumeration via .text disclosure (CWE-200)"
+  C1e.7:
+    category: C1
+    subcategory: C1e
+    name: "Immutable mappings (per-VMA seal against later mprotect/munmap)"
+    vulnerability_class: "post-init mapping permission tampering (CWE-732)"
+  C1e.8:
+    category: C1
+    subcategory: C1e
+    name: "Executable section trap fills (trapsleds)"
+    vulnerability_class: "ROP gadget reuse in alignment padding; fall-through into adjacent code"
+  C1f.1:
+    category: C1
+    subcategory: C1f
+    name: "Memory-safe language usage in kernel code"
+    vulnerability_class: "CWE-787, CWE-416, CWE-125 (entire class)"
+  C2a.1:
+    category: C2
+    subcategory: C2a
+    name: "Software forward-edge CFI"
+    vulnerability_class: "CWE-843"
+  C2a.2:
+    category: C2
+    subcategory: C2a
+    name: "Hardware forward-edge — x86 (indirect branch tracking)"
+    vulnerability_class: "CWE-843"
+  C2a.3:
+    category: C2
+    subcategory: C2a
+    name: "Hardware forward-edge — ARM (branch target identification)"
+    vulnerability_class: "CWE-843"
+  C2b.1:
+    category: C2
+    subcategory: C2b
+    name: "Software backward-edge (shadow call stack / return guard)"
+    vulnerability_class: "ROP"
+  C2b.2:
+    category: C2
+    subcategory: C2b
+    name: "Hardware backward-edge — x86 (shadow stack)"
+    vulnerability_class: "ROP"
+  C2b.3:
+    category: C2
+    subcategory: C2b
+    name: "Hardware pointer authentication (ARM PAC)"
+    vulnerability_class: "pointer forgery, ROP/JOP"
+  C2b.4:
+    category: C2
+    subcategory: C2b
+    name: "Hardware backward-edge — ARM (Guarded Control Stack)"
+    vulnerability_class: "ROP"
+  C2c.1:
+    category: C2
+    subcategory: C2c
+    name: "JIT code hardening"
+    vulnerability_class: "JIT spray"
+  C3a.1:
+    category: C3
+    subcategory: C3a
+    name: "Kernel base address randomization (KASLR / KARL)"
+    vulnerability_class: "CWE-200 (kernel address disclosure)"
+  C3a.2:
+    category: C3
+    subcategory: C3a
+    name: "Fine-grained function randomization (FG-KASLR)"
+    vulnerability_class: "KASLR bypass via known offsets"
+  C3b.1:
+    category: C3
+    subcategory: C3b
+    name: "Kernel page table isolation (KPTI)"
+    vulnerability_class: "CWE-200 (Meltdown)"
+  C3b.2:
+    category: C3
+    subcategory: C3b
+    name: "Supervisor-mode access/execute prevention (SMAP/PAN)"
+    vulnerability_class: "CWE-200 (unintended userspace access)"
+  C3c.1:
+    category: C3
+    subcategory: C3c
+    name: "Memory zeroing on free"
+    vulnerability_class: "CWE-226 (freed memory disclosure)"
+  C3c.2:
+    category: C3
+    subcategory: C3c
+    name: "Stack erasure on syscall return"
+    vulnerability_class: "CWE-200 (stack data leak)"
+  C3c.3:
+    category: C3
+    subcategory: C3c
+    name: "Register scrubbing on function return"
+    vulnerability_class: "CWE-200 (register data leak)"
+  C3d.1:
+    category: C3
+    subcategory: C3d
+    name: "Kernel pointer and log exposure restriction"
+    vulnerability_class: "CWE-200 (kernel address leak)"
+  C3d.2:
+    category: C3
+    subcategory: C3d
+    name: "Kernel diagnostic interface restriction"
+    vulnerability_class: "CWE-200 (procfs/sysfs leak)"
+    scoring_notes: >-
+      Cross-OS precedent: any by-design restriction of kernel diagnostic
+      interfaces counts as presence, even partial or permissive by default —
+      sel4 (capability/config-gated debug syscalls), NetBSD (security.curtain,
+      default off, D=1), FreeBSD (see_other_uids, permissive, D=1), Hurd
+      (device-master-port gate, mandatory for the device layer, D=2). S grades
+      on how much of the diagnostic surface the restriction covers.
+  C4.2:
+    category: C4
+    subcategory:
+    name: "Capability-based access control"
+    vulnerability_class: "CWE-269"
+  C4.3:
+    category: C4
+    subcategory:
+    name: "Syscall attack surface reduction"
+    vulnerability_class: "CWE-269"
+  C4.5:
+    category: C4
+    subcategory:
+    name: "Kernel module / extension loading restrictions"
+    vulnerability_class: "CWE-269"
+  C4.6:
+    category: C4
+    subcategory:
+    name: "Process / resource isolation domains"
+    vulnerability_class: "CWE-269"
+  C4.7:
+    category: C4
+    subcategory:
+    name: "Credential and process relationship hardening"
+    vulnerability_class: "CWE-269"
+    scoring_notes: >-
+      Cross-OS precedent: a uid-based gate on acquiring debug authority over
+      another process, WITHOUT an ancestry/scope filter, scores S=1 (NetBSD
+      uid-match ptrace, Hurd proc-server check_owner); adding a Yama-style
+      ancestry/scope restriction earns S=2 (Linux ptrace_scope, OpenBSD).
+  C4.8:
+    category: C4
+    subcategory:
+    name: "Syscall origin pinning (libc-only syscall entry)"
+    vulnerability_class: "ROP/JOP issuing syscalls from gadget chains (CWE-94)"
+    xref_target: C4.3
+  C5a.1:
+    category: C5
+    subcategory: C5a
+    name: "Driver fault isolation"
+    vulnerability_class: "CWE-829, CWE-862 (driver bugs crashing kernel)"
+    scoring_notes: >-
+      Cross-OS precedent: D grades on default driver-class coverage — D=3
+      requires all drivers in userspace by architecture (Fuchsia "all drivers
+      userspace"); default-on for major classes but with some classes still
+      in-kernel (or one arch opt-in) caps at D=2 (Hurd amd64); an opt-in
+      userspace-driver framework scores D=1 (NetBSD rump).
+  C5a.2:
+    category: C5
+    subcategory: C5a
+    name: "Loadable module / extension isolation"
+    vulnerability_class: "CWE-829, CWE-862"
+  C5a.3:
+    category: C5
+    subcategory: C5a
+    name: "In-kernel VM sandbox (eBPF verifier + runtime)"
+    vulnerability_class: "CWE-829, CWE-862"
+    scoring_notes: >-
+      Cross-OS reconciliation (2026-06-04..06): classic BPF with a
+      registration-time validator (bpf_validate) scores P=1 D=2 S=1 "present,
+      limited" — FreeBSD set the precedent; OpenBSD, NetBSD and Hurd were
+      promoted on the same grounds. S>=2 requires an eBPF-class verifier
+      (program types, maps, register-state tracking).
+  C5b.1:
+    category: C5
+    subcategory: C5b
+    name: "Hypervisor-enforced kernel integrity (HEKI / IKG)"
+    vulnerability_class: "CWE-693, CWE-732 (post-compromise kernel modification)"
+  C5b.2:
+    category: C5
+    subcategory: C5b
+    name: "Enclave-style protection of kernel key material"
+    vulnerability_class: "CWE-693, CWE-732 (key exposure)"
+  C5c.1:
+    category: C5
+    subcategory: C5c
+    name: "DMA / device / peripheral access isolation"
+    vulnerability_class: "CWE-269, CWE-284 (DMA attacks, unauthorized peripheral access)"
+    # Broadened from "IOMMU enforcement" to the abstract property "device/DMA/peripheral
+    # access is bounded to authorized regions/masters" so that non-IOMMU functional
+    # equivalents (Cortex-M MPU bus-master attributes + ARMv8-M TrustZone peripheral
+    # firewalls such as STM32 GTZC / nRF SPU) score under spec §5.3 Rule 2 instead of N/A.
+    # C5c.1 vs C5b.2 (no double-count): the SAME hardware (a TrustZone peripheral firewall)
+    # is scored on two DIFFERENT properties, exactly as the spec scores C5c (primitive) vs
+    # C5d (its application). C5c.1 scores the *primitive* — "is device/peripheral access
+    # bounded to authorized masters?". C5b.2 scores the *application* — "is kernel key
+    # material held in a protected secure-world enclave?". An OS can have the primitive
+    # (C5c.1 P=1) without using it to build a key-material enclave (C5b.2 P=0), and vice
+    # versa, so the two are independent and non-overlapping. (Settled Cortex-M C5c.1
+    # verdicts: freertos P=0, zephyr P=1 via SPU/TF-M, tock P=0; nuttx/contiking still N/A.)
+  C5c.2:
+    category: C5
+    subcategory: C5c
+    name: "Intra-kernel memory-protection domains"
+    vulnerability_class: "CWE-269, CWE-284 (lateral movement)"
+  C5c.3:
+    category: C5
+    subcategory: C5c
+    name: "Memory tagging for isolation (ARM MTE domain separation)"
+    vulnerability_class: "CWE-269, CWE-284"
+  C5d.1:
+    category: C5
+    subcategory: C5d
+    name: "Architectural separation of kernel services"
+    vulnerability_class: "CWE-250 (monolithic attack surface)"
+  C5d.2:
+    category: C5
+    subcategory: C5d
+    name: "Internal compartmentalization (limiting lateral movement)"
+    vulnerability_class: "CWE-250"
+  C5e.1:
+    category: C5
+    subcategory: C5e
+    name: "Fault detection, containment and recovery"
+    vulnerability_class: "DoS via crash / hang / livelock (CWE-755, availability)"
+  C5e.2:
+    category: C5
+    subcategory: C5e
+    name: "Temporal isolation / CPU-budget enforcement"
+    vulnerability_class: "CPU starvation / DoS (CWE-400 uncontrolled resource consumption)"
+  C5e.3:
+    category: C5
+    subcategory: C5e
+    name: "Resource-exhaustion / quota enforcement"
+    vulnerability_class: "resource exhaustion / DoS (CWE-400, CWE-770 allocation without limits)"
+  C6.1:
+    category: C6
+    subcategory:
+    name: "Verified / secure boot chain"
+    vulnerability_class: "CWE-494 (untrusted code execution)"
+  C6.2:
+    category: C6
+    subcategory:
+    name: "Measured boot and remote attestation"
+    vulnerability_class: "CWE-494"
+  C6.3:
+    category: C6
+    subcategory:
+    name: "Kernel code signing enforcement"
+    vulnerability_class: "CWE-494"
+  C6.4:
+    category: C6
+    subcategory:
+    name: "Runtime kernel integrity protection"
+    vulnerability_class: "CWE-829"
+  C6.5:
+    category: C6
+    subcategory:
+    name: "Executable and object integrity verification"
+    vulnerability_class: "CWE-494"
+  C7a.1:
+    category: C7
+    subcategory: C7a
+    name: "Bounds check bypass mitigation (Spectre v1)"
+    vulnerability_class: "Spectre v1 (CVE-2017-5753)"
+  C7a.2:
+    category: C7
+    subcategory: C7a
+    name: "Branch target injection mitigation (Spectre v2 / BTI / Retbleed / BHI)"
+    vulnerability_class: "Spectre v2 (CVE-2017-5715)"
+  C7a.3:
+    category: C7
+    subcategory: C7a
+    name: "Speculative store bypass mitigation (Spectre v4 / SSB)"
+    vulnerability_class: "Spectre v4 (CVE-2018-3639)"
+  C7a.4:
+    category: C7
+    subcategory: C7a
+    name: "Straight-line speculation mitigation (SLS)"
+    vulnerability_class: "SLS (CVE-2021-26341)"
+  C7b.1:
+    category: C7
+    subcategory: C7b
+    name: "Kernel memory read mitigation (Meltdown)"
+    vulnerability_class: "Meltdown (CVE-2017-5754)"
+    xref_target: C3b.1
+  C7b.2:
+    category: C7
+    subcategory: C7b
+    name: "L1 terminal fault mitigation (L1TF / Foreshadow)"
+    vulnerability_class: "L1TF (CVE-2018-3615)"
+  C7c.1:
+    category: C7
+    subcategory: C7c
+    name: "Microarchitectural data sampling mitigation (MDS / TAA / MMIO)"
+    vulnerability_class: "MDS (CVE-2018-12130), TAA, MMIO stale data"
+  C7c.2:
+    category: C7
+    subcategory: C7c
+    name: "Cross-thread speculation isolation (STIBP / SMT disable)"
+    vulnerability_class: "cross-thread speculative leaks"
+  C7d.1:
+    category: C7
+    subcategory: C7d
+    name: "Time protection / cache partitioning"
+    vulnerability_class: "covert/side timing channel (CWE-385, CWE-1303 non-transparent sharing of micro-arch resources)"

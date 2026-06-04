@@ -1,0 +1,2671 @@
+# yaml-language-server: $schema=schema/evaluation.schema.json
+# FreeRTOS kernel hardening evaluation.
+# Primary target: FreeRTOS-Kernel V11.2.0 on ARMv8-M Cortex-M33 with TrustZone
+# and MPU enabled (FreeRTOS-MPU posture); port at portable/GCC/ARM_CM33/
+# {secure,non_secure}/. Kernel source at sources/freertos/ (tag V11.2.0).
+# Comparators: flat (no-MPU) mode on the same CM33 port; Cortex-M4F port; RISC-V port.
+os: freertos
+schema_version: 1
+default_config: "FreeRTOS-Kernel V11.2.0, ARMv8-M Cortex-M33 + TrustZone + MPU (FreeRTOS-MPU), portable/GCC/ARM_CM33/{secure,non_secure}/, default FreeRTOSConfig.h"
+comparator_configs:
+- "Flat / no-MPU on Cortex-M33 (portable/GCC/ARM_CM33_NTZ/non_secure/ or MPU disabled)"
+- "Cortex-M4F (portable/GCC/ARM_CM4F/), no MPU port available"
+- "RISC-V (portable/GCC/RISC-V/), no MPU wrapping"
+
+mechanisms:
+
+  # =========================================================================
+  # C1 — Memory Corruption Prevention
+  # =========================================================================
+
+  C1a.1:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configCHECK_FOR_STACK_OVERFLOW (default 0 — opt-in; values 1 and 2 select two different check styles)"
+      source_files:
+      - "sources/freertos/include/stack_macros.h (taskCHECK_FOR_STACK_OVERFLOW macro; method 1 compares pxTopOfStack against pxStack+portSTACK_LIMIT_PADDING; method 2 also memcmps the last 16 bytes against tskSTACK_FILL_BYTE 0xA5)"
+      - "sources/freertos/tasks.c:1846 (memset of new task stack to tskSTACK_FILL_BYTE 0xA5 in prvInitialiseNewTask when method 2 is in use)"
+      - "sources/freertos/include/FreeRTOS.h:701-702 (#ifndef configCHECK_FOR_STACK_OVERFLOW → default 0)"
+      default_state: >-
+        Disabled by default (configCHECK_FOR_STACK_OVERFLOW=0). Integrators must
+        set it to 1 or 2 in FreeRTOSConfig.h and provide
+        vApplicationStackOverflowHook(). Methods 1 and 2 are guarded by
+        `portUSING_MPU_WRAPPERS != 1`, i.e. on MPU ports the macro is empty and
+        the MPU/Armv8-M hardware stack-limit register is relied on instead.
+    commits:
+    - hash: "39f6b0b5d"
+      date: "2008-03-03"
+      description: "Add stack check macros."
+    discussions: []
+    rationale: |
+      P=1: the kernel ships a stack-overflow detection facility. D=1: it is opt-in
+      via configCHECK_FOR_STACK_OVERFLOW, which defaults to 0; on the flagship
+      Cortex-M33 MPU port the macro is also bypassed in favour of the Armv8-M
+      hardware stack-limit register, so on the MPU posture the on-context-switch
+      software check is structurally inert. S=2: method 1 only catches overflow
+      that is still detectable at the next context switch (a single function
+      blowing past the limit and then returning will be missed); method 2 adds a
+      16-byte 0xA5 sentinel at the far end of the stack but is still
+      context-switch-bound and can be jumped over by a sufficiently large stride.
+      Neither is a per-frame compiler canary; both rely on a hook the application
+      must provide. A=2: in-tree, configurable, but layered on top of the
+      scheduler rather than woven through the codegen. T=3: the mechanism has
+      been part of the kernel for well over a decade (T_age=3) and is actively
+      maintained (T_maintained=3).
+  C1a.2:
+    P: 1
+    D: 2
+    S: 2
+    A: 3
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU (default 0; FreeRTOS-MPU posture sets it to 1)"
+      - "configTOTAL_MPU_REGIONS (must be 8 or 16 on Cortex-M33)"
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:899-986 (prvSetupMPU sets up four background regions: privileged flash RX, unprivileged flash RO, unprivileged syscalls flash RO, privileged RAM RW+XN; per-task regions configured at xTaskCreateRestricted time)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:1211 (xMPU_SETTINGS is the per-TCB MPU-state struct programmed on context switch)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (SVC trampolines that gate access from unprivileged tasks)"
+      default_state: >-
+        When configENABLE_MPU=1 (the FreeRTOS-MPU posture), per-task stacks are
+        wrapped by MPU regions that are unmapped from other tasks: an overrun
+        into adjacent task memory or into privileged RAM traps as a MemManage
+        fault. The Armv8-M PSPLIM/MSPLIM stack-limit registers provide an
+        additional hardware tripwire on the active stack pointer. There is no
+        MMU so no true unmapped guard *page*; the protection is the MPU-region
+        boundary itself, with no slack region between adjacent regions.
+    commits:
+    - hash: "4640196be"
+      date: "2009-09-28"
+      description: "Add CM3 MPU port."
+    - hash: "ce576f368"
+      date: "2019"
+      description: "First Official Release of ARMV8M Support."
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1: a guard-equivalent exists in the form of the MPU region boundary
+      around each task stack plus the Armv8-M PSPLIM register. D=2: enforced by
+      default in the documented MPU posture (configENABLE_MPU=1), but on the
+      kernel's own default (configENABLE_MPU=0) and on non-MPU ports the
+      mechanism is absent. S=2: traps overruns out of the task stack at the
+      hardware level, but adjacent regions touch one another with no unmapped
+      "buffer page" between them (only the MPU permission delta), so a precise
+      out-of-bounds write that targets the very next valid region within the
+      task's own access set is not caught. A=3: this is an architectural
+      property of the port, not a bolt-on. T=3: the MPU port has been part of
+      FreeRTOS for many years and the v2 wrappers and Armv8-M PSPLIM use are
+      actively maintained.
+  C1a.3:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 2
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "portUSING_MPU_WRAPPERS (include/mpu_wrappers.h:34 — gates the wrapper layer; set to 1 only by MPU ports, so the opt-in is choosing an MPU port)"
+      - "configUSE_MPU_WRAPPERS_V1 (include/FreeRTOS.h:79-80 — defaults to 0, i.e. the hardened v2 wrappers are the default once an MPU port is selected)"
+      - "configENABLE_ACCESS_CONTROL_LIST (include/FreeRTOS.h:84-85 — default 0; per-task kernel-object ACL on top of the always-on buffer validation)"
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:2014-2065 (xPortIsAuthorizedToAccessBuffer for the primary Cortex-M33 target: dual portIS_ADDRESS_WITHIN_RANGE endpoint checks + portIS_AUTHORIZED permission check + portADD_UINT32_WILL_OVERFLOW guard)"
+      - "sources/freertos/portable/GCC/ARM_CM4_MPU/port.c:1513-1559 (same validator for the ARMv7-M/PMSAv7 MPU port)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c:2324 (MPU_xQueueReceiveImpl validates the receive buffer for WRITE against the queue item size)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c:4390,4441 (MPU_xStreamBufferSendImpl / ReceiveImpl validate pvTxData READ / pvRxData WRITE)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c:95-114 (IS_EXTERNAL_INDEX_VALID opaque-handle validation against the protected kernel-object pool)"
+      default_state: >-
+        Active by default whenever the MPU posture is selected: choosing an MPU
+        port (portUSING_MPU_WRAPPERS==1) gets the v2 wrappers automatically
+        (configUSE_MPU_WRAPPERS_V1 defaults to 0), and the per-buffer
+        range/permission check runs unconditionally inside v2 — there is no
+        switch to keep v2 while disabling buffer validation. 19
+        buffer-authorization call sites across 15 MPU_*Impl wrappers; 56
+        kernel-object-authorization call sites; 138 wrapper entry points total.
+        On non-MPU ports (the common default configuration, no privilege split)
+        the wrappers compile out entirely.
+    commits:
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    - hash: "6f3586516"
+      date: "2023-08-08"
+      description: "Fix MPU wrapper for vTaskDelete for calling-task deletion (#745) — wrapper-correctness fix in the v2 boundary layer"
+    discussions: []
+    rationale: |
+      P=1: the evaluation's primary target is the MPU posture (Cortex-M33),
+      where unprivileged tasks pass buffers to kernel APIs across an SVC
+      privilege boundary and FreeRTOS ships exactly the bounds+permission
+      validation C1a.3 abstracts — xPortIsAuthorizedToAccessBuffer, the
+      structural twin of zephyr's arch_buffer_validate (P=1 there) and
+      tock's ProcessBuffer. Syscall-dispatch hardening (separate privileged
+      stack, opaque handles) belongs to C4, while buffer-range validation
+      at the boundary is scored here; both count in their respective
+      categories. D=1: exists only on MPU ports, which
+      the integrator must deliberately select (parallel to zephyr's
+      CONFIG_USERSPACE gating). S=2: a genuine bounds-plus-permission walk
+      per buffer (endpoints within one enabled region, R/W direction checked,
+      start+length overflow rejected) — stronger than a null/size check, but
+      held below 3 because coverage is per-wrapper (19 sites), not a single
+      structural choke point; validation depends on the caller-supplied
+      length; and it is a runtime walk, not a type-system guarantee like
+      tock's. A=2: in-tree port-layer + Common wrapper infrastructure,
+      conditional on the MPU configuration. T_age=2: mpu_wrappers_v2 landed
+      2023-07 in V10.6.0 (~3 years). T_maintained=3: actively maintained
+      (39 commits in the last 18 months, releases through V11.2.0; the v2
+      layer itself received fixes in the window). T=min(2,3)=2.
+  C1a.4:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS-Kernel is delivered as portable C sources without its own build
+        system; the integrator's toolchain decides whether _FORTIFY_SOURCE is
+        defined and whether libc supplies __memcpy_chk and friends. The kernel
+        itself includes no fortified-wrapper headers and has no Kconfig-style
+        switch to request them. Cortex-M toolchain libcs (newlib-nano, picolibc)
+        generally do not provide the _chk variants in their default footprint.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the surface exists (the kernel is C and calls memcpy/strncpy-class
+      functions with compile-time-known sizes), but no FORTIFY instrumentation
+      is requested by the kernel and bare-metal libcs (newlib-nano) do not
+      provide the _chk variants by default. This is an un-enabled
+      compiler/libc feature on a live attack surface, the same framing the
+      in-file C1a.7 fork_notes establish and that tock/zephyr use for
+      un-enabled toolchain hardening
+      (zephyr scores P=1 via Picolibc FORTIFY wrappers, proving the mechanism
+      is applicable on Cortex-M). D=S=A=T=0 follow from P=0.
+  C1a.5:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS-Kernel has no in-tree sanitizer plumbing: there is no
+        shadow-memory backing, no redzone insertion in heap_*.c, and no
+        -fsanitize=* flag in the (out-of-tree) build templates.
+        AddressSanitizer's runtime assumes a host operating system with
+        mmap/dlsym, which is unavailable on bare-metal Cortex-M targets.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the out-of-bounds surface exists (unchecked C array/pointer access
+      throughout tasks.c/queue.c/heap_*.c) and no sanitizer instrumentation is
+      wired into the kernel. Zephyr scores P=1 for the same mechanism via
+      CONFIG_ASAN/CONFIG_UBSAN on native_sim/QEMU targets, and FreeRTOS has an
+      equivalent substrate (the POSIX/Linux simulator port) where ASan is
+      usable — so the mechanism is applicable to the ecosystem and merely
+      absent in-tree, not structurally impossible. D=S=A=T=0 follow from P=0.
+  C1a.6:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        ARM MTE is part of ARMv8.5-A / ARMv9-A and ships only on Cortex-A class
+        application cores (e.g. Cortex-A715). The FreeRTOS evaluation target is
+        Cortex-M33 (ARMv8-M), which has no memory-tagging ISA extension.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A on the Cortex-M33 default configuration — the underlying ISA does not
+      expose the feature.
+  C1a.7:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age: 0
+    T_maintained: 0
+    implementation:
+      config_options: []
+      source_files:
+      - "sources/freertos/tasks.c (e.g. the pxReadyTasksLists[ uxPriority ] indexing and the notification-array writes are plain C subscripts with no compiler-inserted bound check)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (IS_EXTERNAL_INDEX_VALID / CONVERT_TO_INTERNAL_INDEX validate the opaque handle index before indexing the kernel-object pool — a hand-written range check on one specific table, not a general UBSAN_BOUNDS instrumentation pass)"
+      default_state: >-
+        A whole-tree grep for -fsanitize / UBSAN / __ubsan returns nothing:
+        FreeRTOS-Kernel ships portable C with no build system, and neither the
+        kernel nor the (out-of-tree) build templates request the compiler's
+        array-bounds instrumentation. The only bounds-style checks present are
+        the manual heap-block bounds test (heap_5.c) and the manual
+        opaque-handle index validation in mpu_wrappers_v2.c — narrow,
+        hand-written guards on individual tables, not a systematic CWE-129
+        instrumentation. The integrator's toolchain decides whether
+        -fsanitize=bounds is on, and arm-none-eabi-gcc/Clang would need a trap
+        handler the kernel does not provide.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the kernel build ships no array-bounds instrumentation — no
+      -fsanitize=bounds, no UBSAN_BOUNDS, no __counted_by, and no trap path
+      for an out-of-bounds subscript. The surface exists (the kernel indexes
+      arrays such as pxReadyTasksLists[uxPriority] with plain C subscripts),
+      so this is a real absent-mechanism, scored P=0 rather than na (see
+      fork_notes for why this diverges from the C1a.5 na precedent).
+      D=S=A=T=0 follow from P=0 per the rubric. The only bounds-style logic in
+      the tree (manual heap-block range test, manual opaque-handle index
+      validation in mpu_wrappers_v2.c) is narrow hand-written checking on
+      individual tables, not the systematic compiler instrumentation C1a.7
+      measures, and whether the integrator enables -fsanitize=bounds is outside
+      the kernel's control (the same framing C2a.1 / C1a.4 / C1c.1 use for
+      compiler features the kernel cannot enforce on the integrator's behalf,
+      but recorded as P=0 because the array-index surface is present rather
+      than structurally absent).
+  C1b.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        All five FreeRTOS heap implementations (heap_1..heap_5) return freed
+        memory to the allocator immediately. heap_4 and heap_5 coalesce adjacent
+        free blocks in-place inside vPortFree → prvInsertBlockIntoFreeList,
+        which is the opposite of a quarantine. There is no kref/RCU subsystem
+        and no type-stable slab cache that could defer reuse across a grace
+        period.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the use-after-free surface plainly exists — FreeRTOS has a kernel
+      heap (heap_1..heap_5) and a UAF there hits a newly recycled allocation
+      on the very next pvPortMalloc — and no allocator-level mitigation
+      (quarantine, delayed reuse, type-stable caches) is present. An OS with
+      a kernel heap cannot be N/A for UAF mitigation (hurd's zalloc heap is
+      scored P=0 on the same grounds); na is reserved for kernels with no
+      heap at all (tock).
+      D=S=A=T=0 follow from P=0.
+  C1b.2:
+    P: 1
+    D: 2
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_HEAP_PROTECTOR (default 0 — opt-in XOR-canary obfuscation of pxNextFreeBlock)"
+      source_files:
+      - "sources/freertos/portable/MemMang/heap_4.c:76-84 (heapBLOCK_ALLOCATED_BITMASK / heapBLOCK_IS_ALLOCATED / heapALLOCATE_BLOCK / heapFREE_BLOCK)"
+      - "sources/freertos/portable/MemMang/heap_4.c:106-131 (heapPROTECT_BLOCK_POINTER XOR-canary wrapper, gated on configENABLE_HEAP_PROTECTOR)"
+      - "sources/freertos/portable/MemMang/heap_4.c:368-372 (vPortFree asserts allocated bit set AND pxNextFreeBlock == NULL — catches double-free and freelist tampering)"
+      - "sources/freertos/portable/MemMang/heap_5.c (heap_5 inherits the same checks; adds multi-region heap support)"
+      - "sources/freertos/include/FreeRTOS.h:2789-2790 (#ifndef configENABLE_HEAP_PROTECTOR → default 0)"
+      default_state: >-
+        In the kernel's default heap_4/heap_5 build, every vPortFree validates
+        that the block currently has the allocation bit set and that its forward
+        pointer is NULL — catching the classic double-free and a class of
+        header-tampering bugs. configENABLE_HEAP_PROTECTOR is off by default;
+        when enabled, it XOR-masks all pxNextFreeBlock writes with a build-time
+        canary (xHeapCanary) and calls heapVALIDATE_BLOCK_POINTER on every
+        traversal. heap_1/heap_2/heap_3 have no equivalent integrity checks;
+        heap_1 cannot even free.
+    commits:
+    - hash: "0d9649ca4"
+      date: "2023"
+      description: "Heap protect (#747)"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/747"
+    rationale: |
+      P=1: heap-metadata integrity exists in the form of the allocation-bit
+      tagging, the double-free assert, and the opt-in XOR freelist canary.
+      D=2: heap_4 / heap_5 are the de-facto defaults for any non-trivial
+      FreeRTOS integration, and the double-free assert and allocation-bit
+      check ship enabled in those allocators — but configENABLE_HEAP_PROTECTOR
+      is off, so the freelist XOR canary is not on by default. S=1: the checks
+      are limited (single MSB bit, single forward-pointer NULL test); there is
+      no per-cache type separation, no inline canary on the user data area,
+      and no freelist randomization. A=2: in-tree allocator design choice. T=3:
+      the heap_4 layout and the double-free assert are years old (T_age=3) and
+      the recent heapPROTECT_BLOCK_POINTER addition shows continued maintenance
+      (T_maintained=3).
+  C1b.3:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS objects (tasks, queues, semaphores, timers) are not
+        reference-counted in the Linux kref sense — ownership is single, set at
+        xTaskCreate/xQueueCreate time and released at the corresponding delete.
+        The few internal counters (uxNumberOfTasks, semaphore use count) are
+        plain UBaseType_t and have no overflow-checked wrapper.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — there is no kernel-internal refcount surface that the
+      refcount_t/RefPtr-with-saturation pattern would protect. The taxonomy
+      already records "no equivalent" for the BSDs on the same grounds.
+  C1b.4:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS's ready/blocked/suspended task lists, timer list, and queue
+        waiter lists are all intrusive doubly-linked lists managed by list.c
+        (vListInsert / vListInsertEnd / uxListRemove). The implementation writes
+        raw pxNext/pxPrevious pointers and does not poison removed nodes or
+        cross-check next->prev == self on traversal. Use of these lists is
+        confined to kernel-internal calls; there is no API that lets a task hand
+        a list-node pointer to the kernel.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the linked-list corruption surface plainly exists — the ready/
+      blocked/suspended task lists, timer list, and queue waiter lists are
+      all intrusive doubly-linked lists with raw pxNext/pxPrevious pointers
+      and no poisoning or next->prev==self consistency checks — and no
+      hardening mechanism is shipped. Zephyr scores the identical situation
+      P=0 (sys_dlist/sys_slist without poisoning), and the BSDs/hurd are P=0
+      on the same grounds; na would wrongly claim the surface is absent for
+      a C kernel whose scheduler is built on intrusive lists. D=S=A=T=0
+      follow from P=0.
+  C1b.5:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Same rationale as C1a.6 — the ISA extension does not exist on
+        Cortex-M33.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A on the Cortex-M33 default configuration.
+  C1c.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS-Kernel ships portable C sources without a build system, so
+        whether GCC/Clang's -ftrivial-auto-var-init=zero is enabled is entirely
+        an integrator decision. The kernel itself has no Kconfig switch that
+        toggles auto-init and no #pragma block that forces it. Task TCBs are
+        explicitly memset to zero in prvInitialiseNewTask (tasks.c), and the
+        stack body is memset to 0xA5 when configCHECK_FOR_STACK_OVERFLOW=2 — but
+        this is initialisation of task-managed memory, not the compiler-level
+        local-variable init the taxonomy is asking about.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the uninitialised-local surface exists (plain C stack locals
+      throughout the kernel) and the kernel does not enable
+      -ftrivial-auto-var-init=zero. An un-enabled compiler feature on a live
+      surface is an absence, not inapplicability — the same framing as the
+      in-file C1a.7/C1c.2 fork_notes and zephyr's C1c.1 P=0. D=S=A=T=0 follow
+      from P=0.
+  C1c.2:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age: 0
+    T_maintained: 0
+    implementation:
+      config_options: []
+      source_files:
+      - "sources/freertos/portable/MemMang/heap_4.c (pvPortMalloc returns the block pointer with no memset; the only zeroing path is vPortFree under configHEAP_CLEAR_MEMORY_ON_FREE)"
+      - "sources/freertos/include/portable.h (pvPortCalloc declaration — implemented as a caller-side malloc+memset; not a heap policy)"
+      default_state: >-
+        There is no zero-on-allocation heap policy: every pvPortMalloc returns
+        whatever bytes were in the freed slab. The closest substitute is the
+        C3c.1 mechanism (configHEAP_CLEAR_MEMORY_ON_FREE), which when enabled
+        zeros each block on free and *as a side-effect* causes the next
+        allocation to come back zero; that is the canonical mechanism for that
+        knob and is scored at C3c.1, not here.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: no heap-allocator zero-on-alloc primitive. D/S/A/T=0 follow. The
+      configHEAP_CLEAR_MEMORY_ON_FREE flag and pvPortCalloc both produce a
+      zeroed-buffer effect for some calling patterns, but neither is a heap
+      allocation-time initialisation policy: the former is a free-time
+      sanitisation (scored at C3c.1) whose alloc-time effect is contingent on
+      the block being freed-then-reallocated, and the latter is a caller-side
+      memset wrapper that only fires when the application chooses pvPortCalloc.
+      The framework's Linux precedent separates CONFIG_INIT_ON_ALLOC from
+      CONFIG_INIT_ON_FREE for exactly this reason; this entry records the
+      alloc-side gap honestly while keeping the kernel-shipped free-side
+      mechanism at its canonical C3c.1 home.
+  C1d.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Each FreeRTOS task has a single stack allocated at task-create time and
+        used unmodified for the lifetime of the task. The Cortex-M exception
+        entry path writes the hardware exception frame at the current PSP
+        without any randomised offset adjustment. No
+        CONFIG_RANDOMIZE_KSTACK_OFFSET equivalent exists.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — there is no entropy source wired into the scheduler/IRQ path that
+      could be repurposed for stack-offset randomisation, and the deterministic
+      fixed-address model is intentional for real-time predictability.
+  C1d.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        heap_4 / heap_5 traverse the freelist from xStart and return the first
+        block large enough to satisfy the request. There is no per-allocation
+        random offset, no random freelist insertion order, and no
+        RANDOM_KMALLOC_CACHES-style cache pool selection.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — heap-layout randomisation requires entropy at every allocation,
+      which the deterministic real-time allocator design intentionally avoids.
+  C1d.3:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS-Kernel includes no randstruct-equivalent compiler-plugin
+        support. The TCB layout is in particular part of the documented ABI
+        (offsetof checks in port asm), so randomising it is structurally
+        incompatible with the port assembly.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the struct-layout-predictability surface exists for the kernel's C
+      structs, and no randstruct-equivalent is shipped; tock's C1d.3 P=0
+      records the same situation. The TCB_t offsetof contracts in port assembly pin
+      *some* layouts, but randstruct-style mechanisms routinely exempt
+      ABI-pinned structs (Linux does the same), so the contract argument
+      narrows the mechanism's reach rather than removing the surface.
+      D=S=A=T=0 follow from P=0.
+  C1e.1:
+    P: 1
+    D: 2
+    S: 3
+    A: 3
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU (default 0; MPU posture sets it to 1)"
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:941-947 (privileged flash: portMPU_REGION_PRIVILEGED_READ_ONLY, executable)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:949-957 (unprivileged flash: portMPU_REGION_READ_ONLY, executable)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:969-977 (privileged RAM: portMPU_REGION_PRIVILEGED_READ_WRITE | portMPU_REGION_EXECUTE_NEVER)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:1211 (xMPU_SETTINGS in TCB drives per-task region permissions on context switch)"
+      - "sources/freertos/portable/GCC/ARM_CM4F/port.c (Cortex-M4 MPU port: equivalent structure)"
+      default_state: >-
+        On the FreeRTOS-MPU posture, the Armv8-M MPU strictly separates RO+X
+        kernel/app flash from RW+XN RAM. Task RAM is XN both for the task itself
+        (cannot execute its own stack/heap) and from privileged mode by virtue
+        of the same MPU region. There is no facility to allocate a runtime W+X
+        region — the MPU permission bits are fixed at region-configure time and
+        FreeRTOS exposes no JIT loader. On the no-MPU posture, all of RAM is
+        implicitly XN only if the Cortex-M memory map's default permissions say
+        so (SRAM is XN by default on Armv8-M); kernel code stays RO+X because it
+        lives in flash, but there is no software W^X to speak of.
+    commits:
+    - hash: "ce576f368"
+      date: "2019"
+      description: "First Official Release of ARMV8M Support."
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1: W^X is implemented in the MPU port. D=2: enforced by default in the
+      documented MPU posture but not in the flat (no-MPU) posture; the Armv8-M
+      "SRAM is XN" architectural default provides a weaker NX backstop in flat
+      mode. S=3: hardware-enforced by the MPU permission bits — there is no
+      runtime path (module loader, JIT, runtime patch) that lifts XN or makes
+      flash writable. A=3: the linker carve-out of __privileged_functions /
+      __syscalls_flash / __privileged_sram and the prvSetupMPU programming are
+      foundational port choices, not an opt-in layer. T=3 — the MPU port and
+      the linker section discipline have been in place for many years and are
+      actively maintained.
+  C1e.2:
+    P: 1
+    D: 2
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 2
+    implementation:
+      config_options: []
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:949-957 (unprivileged flash region mapped portMPU_REGION_READ_ONLY for the life of the kernel)"
+      - "sources/freertos/include/FreeRTOS.h (PRIVILEGED_DATA / PRIVILEGED_FUNCTION attribute macros place symbols in dedicated linker sections, but the gate is privilege, not post-init read-only)"
+      default_state: >-
+        Anything declared `const` in the kernel sources ends up in the .rodata
+        region of flash and is therefore RO+X for the kernel's whole lifetime.
+        There is no __ro_after_init annotation, no .data..ro_after_init linker
+        section, and no boot-time call that walks initialised mutable globals
+        and re-maps them read-only. PRIVILEGED_DATA placement isolates kernel
+        state from unprivileged tasks but is not a post-init transition.
+    commits:
+    - hash: "ce576f368"
+      date: "2019"
+      description: "First Official Release of ARMV8M Support."
+    discussions: []
+    rationale: |
+      P=1: there is an effective read-only-data discipline driven by the linker
+      placement of `const` in flash. D=2: anything declared `const` is RO by
+      default. S=1: real coverage is limited to what the author remembered to
+      mark `const`; mutable globals that are written exactly once at init
+      (timer-list head, scheduler state) stay RW indefinitely, which is the
+      gap __ro_after_init exists to close. A=2: linker discipline, not a
+      kernel-level mechanism. T_age=3 (the linker placement is long-standing),
+      T_maintained=2 (no recent work in this area); T = min(3,2) = 2.
+  C1e.3:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition)"
+      source_files:
+      - "sources/freertos/tasks.c (xTaskCreateRestricted takes a TaskParameters_t with up to portNUM_CONFIGURABLE_REGIONS MemoryRegion_t entries; permissions like tskMPU_REGION_READ_ONLY/READ_WRITE/EXECUTE_NEVER are applied at xMPU_SETTINGS programming time)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (no SVC for 'lock further MPU changes'; vTaskAllocateMPURegions remains callable to update regions)"
+      default_state: >-
+        Task creators may flag any MemoryRegion_t entry as RO
+        (tskMPU_REGION_READ_ONLY), and that permission is enforced by the MPU
+        for the task. However, privileged code can always re-program the MPU at
+        runtime — vTaskAllocateMPURegions / prvSetupMPU / direct MPU register
+        writes are not sealed after init. There is no kern.securelevel-style
+        monotonic switch.
+    commits:
+    - hash: "4640196be"
+      date: "2009-09-28"
+      description: "Add CM3 MPU port."
+    - hash: "ce576f368"
+      date: "2019"
+      description: "First Official Release of ARMV8M Support."
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1: per-region RO configuration exists. D=1: only applied if the
+      application uses xTaskCreateRestricted and asks for RO; default
+      xTaskCreate gives the default permission set. S=2: hardware-enforced for
+      unprivileged tasks, but trivially undone by any privileged code path, so
+      it does not survive a kernel-mode compromise. A=2: in-tree feature of
+      the MPU API. T=3: the MPU restricted-task API has been part of the port
+      for many years.
+  C1e.4:
+    P: 1
+    D: 2
+    S: 3
+    A: 3
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition)"
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:969-977 (privileged RAM: portMPU_REGION_EXECUTE_NEVER)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c (per-task RAM regions inherit XN via xMPU_SETTINGS)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (privilege transition is gated by SVC; tasks cannot directly jump into privileged_functions code)"
+      default_state: >-
+        On the MPU posture the SMEP/PXN-equivalent is achieved by two
+        complementary MPU rules: (a) the privileged-RAM region is XN, so kernel
+        data is never executable, and (b) per-task RAM regions are XN even from
+        privileged mode, so a task can never execute code it has placed in its
+        own RAM. The only executable text is privileged-flash and
+        unprivileged-flash, both RO. The mpu_wrappers_v2 SVC trampolines are the
+        only gateway from unprivileged to privileged execution.
+    commits:
+    - hash: "ce576f368"
+      date: "2019"
+      description: "First Official Release of ARMV8M Support."
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1. D=2: enforced by default in the MPU posture; not present on the
+      flat (no-MPU) posture. S=3: hardware-enforced by the MPU XN bit; any
+      attempt to fetch from an XN region traps as a MemManage fault. A=3:
+      architectural property of the port. T=3: the XN-on-RAM discipline has
+      been part of the MPU port from inception and is actively maintained.
+  C1e.5:
+    P: 1
+    D: 2
+    S: 2
+    A: 3
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition)"
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:969-977 (privileged-RAM MPU region: portMPU_REGION_PRIVILEGED_READ_WRITE → unprivileged tasks have no access)"
+      - "sources/freertos/tasks.c (TCB_t and xMPU_SETTINGS are embedded together; TCB is allocated from kernel heap which lives in __privileged_sram_*)"
+      - "sources/freertos/list.c (kernel List_t structures (ready/delayed/suspended) reside in privileged data)"
+      default_state: >-
+        All FreeRTOS kernel control structures — the TCB list,
+        ready/delayed/suspended lists, queue/semaphore objects allocated through
+        pvPortMalloc, and xMPU_SETTINGS — sit inside the privileged-RAM linker
+        region. The MPU's privileged-RAM region (PRIV_RW only) means
+        unprivileged tasks cannot read or write any of this state; they only see
+        their own task RAM and the unprivileged-flash code. This is the
+        structural analogue of CONFIG_THREAD_INFO_IN_TASK + per-CPU-area
+        isolation, achieved by MPU privilege rather than by
+        KASLR-of-task_struct.
+    commits:
+    - hash: "ce576f368"
+      date: "2019"
+      description: "First Official Release of ARMV8M Support."
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1. D=2: isolation is the default in the MPU posture (the MPU is
+      configured with PRIV_RW on privileged RAM before the scheduler starts);
+      in flat mode there is no isolation at all. S=2: strong against
+      unprivileged tasks, but the TCB still sits in the same heap as other
+      privileged allocations, so a kernel-side overflow is not contained — this
+      is a step short of, e.g., putting TCBs in a separately-mapped guarded
+      region. A=3: architectural property of the port. T=3.
+  C1e.6:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        The Armv8-M MPU access-permission field has four values (PRIV-only RW,
+        PRIV-only RO, RW for all, RO for all); none of them describe an
+        execute-only mapping. There is no architectural mechanism to make a
+        flash region executable but unreadable by the same privilege level.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the ISA's MPU permission encoding has no execute-only state.
+  C1e.7:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Privileged code can rewrite any MPU_RBAR/MPU_RLAR pair at any time
+        (vTaskAllocateMPURegions, prvSetupMPU, direct register writes). There is
+        no monotonic 'seal this region' API and no per-region immutable bit in
+        the MPU encoding.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the MPU is by design a fully mutable register file; the mseal/
+      mimmutable design pattern requires a sealable VMA abstraction that
+      FreeRTOS does not have.
+  C1e.8:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        GNU ld pads .text alignment gaps with 0x00 on ARM, which decodes to UDF
+        (permanently-undefined) on Thumb only by coincidence (0x0000 is `MOVS
+        r0, r0`, not a trap); GNU ld's --pad-to-power-of-2 / fill-byte mechanism
+        is not wired up in the FreeRTOS-MPU linker scripts to insert deliberate
+        trap instructions. The taxonomy hint table intentionally omits a
+        freertos line for this row.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: executable alignment padding exists in the firmware image and no
+      trap-fill mitigation is applied to it (tock's C1e.8 P=0 records the
+      same rule). The architecture's lack of a clean trap-fill story
+      (Thumb-2 has no INT3/UD2 idiom and GNU ld's 0x0000 fill is MOVS r0,r0,
+      not a trap) is part of why the mitigation is absent, not a reason the
+      padding surface vanishes. D=S=A=T=0 follow from P=0.
+  C1f.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Every source file under the kernel (tasks.c, queue.c, list.c, timers.c,
+        event_groups.c, stream_buffer.c, croutine.c, the heap_*.c
+        implementations, mpu_wrappers_v2.c, and every port.c) is C, supplemented
+        by hand-written assembly under portable/GCC/*/*. There is no
+        Rust-for-FreeRTOS effort comparable to Rust-for-Linux.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: no memory-safe language is used in the kernel. The mechanism
+      (adopting a memory-safe language for kernel code) is applicable to any
+      C kernel, and
+      the peer evaluations record the same situation as P=0 (fuchsia's C++
+      Zircon, netbsd, hurd). N/A would imply the memory-unsafety surface does
+      not exist, which is the opposite of the truth for a C code base.
+      D=S=A=T=0 follow from P=0.
+  C2a.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS-Kernel ships portable C sources and no build system, so whether
+        Clang's KCFI / -fsanitize=cfi-icall is in effect is entirely the
+        integrator's decision. There is no Kconfig-style switch, no port-level
+        CMake fragment, and no source-level annotation (e.g. __nocfi) that
+        requests it. The kernel makes indirect calls via TaskHookFunction_t,
+        TaskFunction_t, vApplicationTickHook and the timer callback list — none
+        of these are guarded by a typed-call check.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the indirect-call surface exists (TaskFunction_t, hook functions,
+      timer callback lists — none guarded by a typed-call check) and no
+      forward-edge CFI is applied to the kernel build. Tock and zephyr score
+      the identical situation P=0 ("the attack surface exists; no software CFI
+      instrumentation is applied"), and na would wrongly claim the
+      control-flow-hijack surface is absent. That arm-none-eabi-gcc lacks KCFI
+      explains the absence; it does not remove the surface. D=S=A=T=0 follow
+      from P=0.
+  C2a.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Intel CET Indirect Branch Tracking is part of the x86_64 ISA. The
+        FreeRTOS evaluation target is ARMv8-M Cortex-M33; the analogue feature
+        for ARM (BTI) is evaluated separately under C2a.3.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A on Cortex-M — the underlying ISA does not expose IBT.
+  C2a.3:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 2
+    T_maintained: 2
+    implementation:
+      config_options:
+      - "configENABLE_BTI (default 0; defined in include/FreeRTOS.h, intended for ARMv8.1-M ports)"
+      source_files:
+      - "sources/freertos/include/FreeRTOS.h:3043-3051 (#ifndef configENABLE_PAC / configENABLE_BTI → default 0)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:384-393 (portCONTROL_UBTI_EN / portCONTROL_BTI_EN bit definitions; ID_ISAR5 read to verify FEAT_PACBTI implementation)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:2249-2281 (prvConfigurePACBTI: configASSERT on portID_ISAR5_REG, sets BTI_EN | UBTI_EN in CONTROL, executes `msr control, %0` when xWriteControlRegister==pdTRUE)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:1549-1555, 1822-1828 (prvConfigurePACBTI invoked from pxPortInitialiseStack for each task and from xPortStartScheduler at boot)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/portmacrocommon.h:131-141 (configENABLE_PAC declarations)"
+      default_state: >-
+        configENABLE_BTI defaults to 0. When enabled in FreeRTOSConfig.h, the
+        CM33 port sets BTI_EN|UBTI_EN in the v8.1-M CONTROL register at
+        scheduler start (and re-confirms the value on each task switch); it also
+        asserts that ID_ISAR5 reports FEAT_PACBTI presence. Indirect branches
+        into non-BTI-landing-pad code then trap as UsageFault. On baseline
+        Cortex-M33 silicon (no FEAT_PACBTI) the configASSERT fails; on
+        Cortex-M85 / Cortex-M52 (which implement FEAT_PACBTI) the protection is
+        real. The integrator must also build the kernel and application with
+        `-mbranch-protection=bti` for the toolchain to emit BTI landing pads.
+    commits:
+    - hash: "7081e76f5"
+      date: "2024"
+      description: "Armv8.1-m: Add pacbti support (#1147)"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/1147"
+    rationale: |
+      P=1: the kernel ships an opt-in BTI port for ARM_CM33 with first-class
+      hooks in the context-switch path. D=1: configENABLE_BTI defaults to 0 and
+      the integrator must additionally compile with -mbranch-protection=bti.
+      S=2: on FEAT_PACBTI silicon the CONTROL.BTI_EN gate is hardware-enforced
+      and indirect-branch-into-non-landing-pad traps as UsageFault — but
+      coverage is bounded by what the compiler annotates, and a kernel built
+      without -mbranch-protection has no landing pads to enforce against. A=2:
+      in-tree port option layered on top of the ARMv8.1-M architecture, not a
+      core architectural property of the port. T=2: BTI support was added in
+      the FreeRTOS-Kernel V11.x line in 2023–2024 (T_age=2) and remains
+      actively maintained (T_maintained=2).
+  C2b.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Return addresses for tasks live on the task's regular descending stack
+        (PSP-based) and on the Cortex-M exception frame; there is no parallel
+        shadow stack maintained by the kernel or compiler. The MPU posture
+        protects the on-stack return values from other tasks but does not
+        duplicate them. Clang's shadow-call-stack runtime requires a reserved
+        register (x18 on AArch64) that the AArch32 / Thumb ABI used on Cortex-M
+        does not earmark.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the ROP surface exists (return addresses live unprotected on the
+      task stack and exception frame) and no software shadow stack is
+      implemented; tock and zephyr score the same absence P=0 on the same
+      Cortex-M targets. The AArch32/Thumb ABI's lack of a reserved
+      register for Clang SCS explains why the mitigation is missing; it does
+      not make return-address corruption inapplicable. D=S=A=T=0 follow from
+      P=0.
+  C2b.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Intel CET shadow stack is part of the x86_64 ISA. The FreeRTOS
+        evaluation target is Cortex-M33; the analogue ARM mechanism (PAC for
+        return-address signing) is evaluated under C2b.3.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A on Cortex-M — the underlying ISA does not expose CET.
+  C2b.3:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 2
+    T_maintained: 2
+    implementation:
+      config_options:
+      - "configENABLE_PAC (default 0; defined in include/FreeRTOS.h, intended for ARMv8.1-M ports)"
+      source_files:
+      - "sources/freertos/include/FreeRTOS.h:3043-3051 (#ifndef configENABLE_PAC / configENABLE_BTI → default 0)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/portmacrocommon.h:131-141 (vApplicationGenerateTaskRandomPacKey() prototype; user must provide an RNG-backed implementation)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/portmacrocommon.h:240-348 (MAX_CONTEXT_SIZE arithmetic adds a 16-word TaskPacKey slot to each TCB context layout when configENABLE_PAC==1)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:384-393 (portCONTROL_UPAC_EN / portCONTROL_PAC_EN bit definitions)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:1549-1602 (per-task PAC key generation in pxPortInitialiseStack: vApplicationGenerateTaskRandomPacKey() populates ulTaskPacKey[4] which is then stored in the TCB context)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:2249-2281 (prvConfigurePACBTI: sets PAC_EN | UPAC_EN in CONTROL and msr-writes it at scheduler start)"
+      - "sources/freertos/portable/ARMv8M/non_secure/portable/GCC/ARM_CM33/portasm.c:105-148, 319-322, 386-389, 468-471 (msr PAC_KEY_P_0..PAC_KEY_P_3 / mrs PAC_KEY_P_0..PAC_KEY_P_3 in PendSV_Handler — task-private PAC key is loaded on dispatch and saved on preempt)"
+      default_state: >-
+        configENABLE_PAC defaults to 0. When enabled, the kernel: (a) requires
+        the integrator to supply vApplicationGenerateTaskRandomPacKey() —
+        typically backed by an on-chip TRNG; (b) generates a fresh 128-bit PAC
+        key per task at xTaskCreate time and stores it in the TCB; (c) on every
+        context switch the PendSV handler MSRs the outgoing task's
+        PAC_KEY_P_{0..3} registers and restores the incoming task's; (d) enables
+        CONTROL.PAC_EN | CONTROL.UPAC_EN so that PACI/AUTI instructions (which
+        the toolchain must be told to emit via -mbranch-protection=pac-ret)
+        actually sign and verify return addresses. As with BTI, the
+        configASSERT(portID_ISAR5_REG != 0) catches silicon that lacks
+        FEAT_PACBTI.
+    commits:
+    - hash: "7081e76f5"
+      date: "2024"
+      description: "Armv8.1-m: Add pacbti support (#1147)"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/1147"
+    rationale: |
+      P=1: the kernel ships an opt-in ARM PAC port for ARM_CM33 with per-task
+      key isolation across context switches — substantially more than just a
+      compile-time toggle. D=1: configENABLE_PAC defaults to 0, the integrator
+      must also implement an RNG hook and build with -mbranch-protection=pac-ret.
+      S=2: on FEAT_PACBTI silicon return-address forgery requires guessing a
+      task-private 128-bit key, and the key is rotated across tasks so a leak
+      in one task does not compromise another — but a kernel-mode compromise
+      can read the keys out of any TCB and the protection is only as wide as
+      the compiler's pac-ret instrumentation. A=2: in-tree port option, not a
+      core architectural property. T=2: PAC support landed in the V11.x kernel
+      line in 2023–2024 (T_age=2) and continues to be maintained
+      (T_maintained=2).
+  C2b.4:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FEAT_GCS is defined for the Armv9.4-A application-profile architecture
+        and ships only on recent Cortex-A class cores; it has no encoding in
+        Armv8-M / Cortex-M33. The FreeRTOS evaluation target is Cortex-M33,
+        which has no GCS register set and no GCS-aware exception flow. The
+        kernel's backward-edge story on Cortex-M is instead the (opt-in,
+        silicon-gated) ARM PAC scaffolding scored at C2b.3 plus the software
+        stack-overflow check at C1a.1; there is no GCS equivalent to score here.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A on the Cortex-M33 default configuration — the underlying ISA does
+      not expose FEAT_GCS. Mirrors the framework's N/A treatment of the other
+      A-profile/x86-only ISA features on this target (C2b.2 Intel CET shadow
+      stack, C1a.6 / C1b.5 ARM MTE), and matches the taxonomy hint
+      ("N/A on Cortex-M (FEAT_GCS is ARMv9.4-A only)"). Note that linux scores
+      C2b.4 na on its x86-64 primary as well (GCS is EL0-only even on ARMv9.4
+      silicon), so na here keeps cross-OS ordering consistent.
+  C2c.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        The kernel is a pure scheduler / IPC / timer / heap core. There is no
+        in-tree eBPF analogue, no Lua/JS engine, and no dynamic-code path that
+        would emit instructions at runtime. The MPU-mode XN-on-RAM rule (scored
+        under C1e.4) would in any case prevent execution of anything written to
+        a task's data region.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — no in-kernel JIT to harden. Same posture as openbsd/netbsd/fuchsia.
+  C3a.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS-Kernel runs from a fixed flash region whose base is fixed by
+        the integrator's linker script (e.g. 0x08000000 on STM32H5). The kernel
+        performs no self-relocation at boot; there is no MMU, so 'virtual base'
+        and 'physical base' are the same single address, and that address is
+        constant across reboots. The taxonomy hint already records: 'N/A —
+        kernel image at fixed link address; no base relocation'.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the KASLR/KARL threat model presumes a relocatable kernel image
+      mapped through MMU page tables that boot-time entropy can shuffle.
+      FreeRTOS has neither: the image is linked once at a fixed flash address
+      and runs in place. The 'kernel address disclosure' attack surface that
+      this mechanism is meant to defend (an unprivileged user reading a leaked
+      kernel pointer and deriving the rest of the layout from it) does not
+      exist here — there is no MMU-mediated user mode that would benefit from
+      not knowing the kernel layout, and integrator-built firmware images are
+      single-image binaries with the layout known to anyone who has the .elf.
+  C3a.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Function placement in the FreeRTOS image is determined entirely at link
+        time by the integrator's linker script and the GCC/Clang section
+        ordering. There is no boot-time pass that permutes function offsets and
+        no compiler plugin equivalent to Linux's CONFIG_FG_KASLR. Without a base
+        randomisation (C3a.1 N/A) there is also no granularity finer than that
+        to randomise on top of.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — FG-KASLR is an enhancement to KASLR; both presuppose a relocatable
+      kernel image and an attacker who only sees pointer leaks. FreeRTOS has
+      neither prerequisite. The taxonomy hint already records: 'N/A — no KASLR'.
+  C3b.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Cortex-M33 has an MPU, not an MMU; there are no page tables and no
+        per-process address spaces to swap on syscall entry. The Meltdown family
+        of attacks targets speculative dereferences across the kernel/user
+        page-table boundary on Cortex-A class application cores; Cortex-M is an
+        in-order microcontroller architecture without that boundary or that
+        speculation surface. Privilege isolation on FreeRTOS-MPU is enforced by
+        the MPU permission bits (PRIV-only vs all-access) rather than by
+        separate address spaces.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the KPTI mechanism is a defence against Meltdown-class transient
+      reads across an MMU page-table boundary that does not exist on Cortex-M.
+      The architectural substrate (MMU, page tables, out-of-order speculative
+      load that survives a permission fault) is absent. The taxonomy hint
+      already records: 'N/A — no MMU page tables; MPU regions enforce
+      isolation'. The MPU isolation that takes its place is scored under
+      C1e.4 and C1e.5.
+  C3b.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Armv8-M does not implement the PAN (Privileged Access Never) bit of
+        Armv8-A or the SMAP CR4 bit of x86. The architectural substitute on
+        Cortex-M33 is the MPU's per-region access-permission field: regions
+        configured as PRIV_RW (privileged RAM, kernel control structures) are
+        inaccessible to unprivileged tasks, and regions configured for the
+        unprivileged task are normal accesses for both privileged and
+        unprivileged code — there is no extra bit that makes the kernel
+        temporarily blind to its own data while running privileged. The intent
+        of SMAP/PAN (prevent unintended kernel dereferences of
+        attacker-controlled user memory) is approximated by the MPU layout
+        rather than by a CPL-orthogonal access-control bit.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the ISA on the evaluation target does not expose a SMAP/PAN-style
+      mode bit, and the FreeRTOS-MPU layout achieves the underlying privilege
+      separation through MPU permission bits (scored under C1e.4 and C1e.5)
+      rather than through a separate per-instruction access gate. The
+      taxonomy hint already records: 'N/A on Cortex-M (no SMAP/PAN); MPU
+      access bits give equivalent'.
+  C3c.1:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 2
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configHEAP_CLEAR_MEMORY_ON_FREE (default 0 — opt-in zeroing of freed blocks; supported by heap_2, heap_4, heap_5)"
+      source_files:
+      - "sources/freertos/portable/MemMang/heap_4.c:54-55 (#ifndef configHEAP_CLEAR_MEMORY_ON_FREE → default 0)"
+      - "sources/freertos/portable/MemMang/heap_4.c:379-388 (memset(puc + xHeapStructSize, 0, ...) inside vPortFree, gated on configHEAP_CLEAR_MEMORY_ON_FREE)"
+      - "sources/freertos/portable/MemMang/heap_5.c:88-89, 414 (same shape, multi-region heap)"
+      - "sources/freertos/portable/MemMang/heap_2.c:55-56, 320 (heap_2 also supports the flag)"
+      default_state: >-
+        configHEAP_CLEAR_MEMORY_ON_FREE defaults to 0 in heap_2, heap_4 and
+        heap_5. When the integrator sets it to 1, vPortFree memsets each
+        released allocation's user payload to zero before returning the block to
+        the freelist. heap_1 (no free) and heap_3 (wraps the toolchain's
+        malloc/free) do not support the flag. As a side-effect, when the flag is
+        enabled every subsequent pvPortMalloc returns zero-initialised memory,
+        which substitutes for the absent zero-on-alloc heap policy (recorded at
+        C1c.2).
+    commits:
+    - hash: "82be77995"
+      date: "2022"
+      description: "Heap improvements (#462)"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/462"
+    rationale: |
+      P=1: configHEAP_CLEAR_MEMORY_ON_FREE is the kernel-side zero-on-free
+      mechanism — the canonical match for the C3c.1 "memory zeroing on free"
+      taxonomy entry. D=1: defaults to 0 in every heap_*.c that supports it,
+      so out-of-the-box vPortFree leaves the freed block contents intact.
+      S=1: when enabled, closes the freed-memory-disclosure class for blocks
+      that pass through vPortFree, but heap_1 / heap_3 cannot use the flag,
+      and stack memory / TCB internals are not on the heap so they are
+      unaffected. A=2: in-tree allocator option, not an architectural lift.
+      T_age=2 / T_maintained=3 → T=2: configHEAP_CLEAR_MEMORY_ON_FREE was
+      added relatively recently to the heap_4 family and continues to receive
+      attention. The alloc-side gap is recorded separately at C1c.2 (P=0).
+  C3c.2:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        On the MPU posture, SVC-mediated calls into the kernel use the calling
+        task's own PSP stack to push the exception frame and run the wrapper;
+        the SVC handler returns by popping that frame and resuming the task.
+        There is no memset of the high-water portion of the stack before
+        returning to unprivileged mode, and there is no separate kernel stack
+        whose contents would be hidden from the unprivileged task even if
+        scrubbed. In flat mode the question is moot — there is only one
+        privilege level and one stack per task. The taxonomy hint already
+        records: 'N/A — SVC syscall return path does not scrub stack'.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the privileged-stack surface does exist on the MPU posture — the
+      v2 MPU port gives each task a dedicated system-call stack
+      (xSystemCallStackInfo, switched in vSystemCallEnter and restored in
+      vSystemCallExit) and handler-mode code runs on the MSP — and neither is
+      scrubbed on return to unprivileged mode. The stackleak-class infoleak
+      channel (stale privileged-stack bytes copied
+      out through partially-initialised structures) maps the same way it does
+      on zephyr and tock, both of which score this absence P=0. MPU
+      unreachability of the stacks (C1e.5) limits direct reads but not
+      copy-out leaks. D=S=A=T=0 follow from P=0.
+  C3c.3:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS-Kernel ships portable C sources without a build system, and no
+        port .mk fragment requests -fzero-call-used-regs. The Cortex-M
+        context-switch path (PendSV_Handler in portasm.c) saves R4-R11 and the
+        PSP of the outgoing task and restores those of the incoming task; it
+        does not zero any registers as a leak-prevention measure.
+        Caller-clobbered registers (R0-R3, R12) are not explicitly scrubbed
+        either at function return or at PendSV exit — the task that gets
+        dispatched simply overwrites them. The taxonomy hint already records:
+        'N/A — no register scrubbing on context switch'.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: register-leak boundaries exist (function returns inside privileged
+      code, SVC exit, the PendSV context switch) and no register scrubbing is
+      applied at any of them — the kernel does not request
+      -fzero-call-used-regs and the context-switch path restores the
+      ABI-defined register sets without zeroing. Tock and zephyr score the
+      identical absence P=0, and an un-enabled compiler feature on a live
+      surface is an
+      absence per the in-file C1a.7/C1c.2 fork_notes framing. D=S=A=T=0
+      follow from P=0.
+  C3d.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS-Kernel has no printk / dmesg infrastructure: there is no kernel
+        log ring buffer that a task could read. Diagnostic output, when
+        integrators want it, goes through application-provided hooks (a
+        serial-port putchar wrapper invoked by configPRINT_STRING or by
+        Tracealyzer-style trace macros), and those hooks are part of the
+        application, not a kernel-visible interface. There is no kallsyms table
+        at runtime — symbol resolution happens at link time and is discarded;
+        the .elf is held by the developer, not the device. The trace facility
+        (traceTASK_SWITCHED_IN, etc., in include/FreeRTOS.h) is opt-in
+        instrumentation that emits to an integrator-controlled sink, not a
+        kernel-side log queryable by unprivileged tasks.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the kptr_restrict / dmesg_restrict threat model presumes a
+      kernel-maintained log and a kallsyms-style symbol map that
+      unprivileged users can read by default. FreeRTOS has neither: there is
+      no in-kernel log buffer, no /proc/kallsyms equivalent, and no
+      filesystem through which such an interface could exist. The attack
+      surface that the mechanism is meant to defend does not exist. This
+      mirrors the framework's N/A treatment of Fuchsia for the same
+      mechanism (Fuchsia is listed as N/A
+      because "no dmesg, kallsyms; logs capability-gated by design"; the
+      FreeRTOS situation is even simpler — there is no log at all).
+  C3d.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS-Kernel ships no filesystem layer; integrators who want one bolt
+        on FreeRTOS-Plus-FAT or LittleFS as application-level libraries.
+        Crucially, there is no /proc, /sys, or /dev equivalent maintained by the
+        kernel itself. The SVC dispatch table in mpu_wrappers_v2.c is the entire
+        user-to-kernel interface; that interface surface is scored under C4
+        (privilege boundary enforcement) rather than as an
+        information-disclosure interface. The framework lists Fuchsia as N/A for
+        this mechanism because 'no procfs/sysfs interfaces exist'; the same
+        reasoning applies even more strongly to FreeRTOS, which additionally has
+        no filesystem subsystem in the kernel.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — there is no kernel-side diagnostic filesystem (procfs, sysfs,
+      debugfs) and no other generic introspection interface that would need
+      a hidepid / protect_regular style restriction layered on. The attack
+      surface the mechanism defends does not exist. This mirrors Fuchsia's
+      explicit N/A and Fiasco's N/A on the same grounds. The closest functional analogue — the SVC syscall
+      surface itself — is covered by C4.3 (syscall attack surface
+      reduction), not by C3d.2.
+  C4.2:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 2
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition)"
+      - "configUSE_MPU_WRAPPERS_V1=0 (use the opaque-handle v2 layer; default for new MPU configs)"
+      - "configENABLE_ACCESS_CONTROL_LIST=1 (default 0 — gates the per-task ACL bitmap; without it xPortIsAuthorizedToAccessKernelObject returns pdTRUE unconditionally for all unprivileged tasks)"
+      - "configPROTECTED_KERNEL_OBJECT_POOL_SIZE (sizes the global handle table)"
+      source_files:
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (KernelObject_t pool, MPU_GetFreeIndexInKernelObjectPool / MPU_StoreHandleAndDataAtIndex / MPU_GetHandleAtIndex; CONVERT_TO_EXTERNAL_INDEX with INDEX_OFFSET=1 hands the unprivileged task an opaque integer rather than the real kernel pointer)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c:495 (xPortIsAuthorizedToAccessKernelObject called before MPU_xQueueGenericSendImpl dispatches into the real xQueueGenericSend; same pattern repeated for ~20 other queue/task/timer/event-group entry points)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:2156 (vPortGrantAccessToKernelObject / vPortRevokeAccessToKernelObject set/clear bits in xMPU_SETTINGS.ulAccessControlList)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:2196 (xPortIsAuthorizedToAccessKernelObject: tests the calling task's ACL bit for the kernel-object index; privileged tasks bypass; non-ACL build returns pdTRUE)"
+      default_state: >-
+        On the FreeRTOS-MPU posture with v2 wrappers, every kernel object an
+        unprivileged task can reach is referenced by an opaque integer index
+        (KernelObject_t pool); the kernel pointer never escapes the
+        privileged-RAM region. When configENABLE_ACCESS_CONTROL_LIST is also
+        set, each task additionally carries an ulAccessControlList[] bitmap and
+        the SVC dispatcher rejects calls whose target index is not flagged for
+        the calling task, which is the closest thing FreeRTOS has to per-task
+        object capabilities. configENABLE_ACCESS_CONTROL_LIST defaults to 0, so
+        on a default MPU build any unprivileged task can invoke any kernel
+        object the v2 layer can resolve — the opaque-index indirection still
+        blocks pointer forgery but not authority sharing.
+    commits:
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    - hash: "170a291d4"
+      date: "2023"
+      description: "Add Access Control List to MPU ports (#765)"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/765"
+    rationale: |
+      P=1: there is per-task object-access enforcement, even if it is not a
+      classical capability system. D=1: configENABLE_ACCESS_CONTROL_LIST
+      defaults to 0; the opaque-handle indirection that ships with v2 wrappers
+      is enabled by default on the MPU posture but it only prevents pointer
+      forgery, not authority sharing. S=1: even with the ACL turned on, this
+      is a coarse per-object permit/deny bitmap — there are no rights masks
+      (no R vs RW distinction on a queue, no derive/delegate primitives, no
+      revocation cascade); capabilities cannot be transferred between tasks
+      except by privileged code editing the bitmap, and a single compromised
+      privileged task or a kernel-mode write primitive trivially rewrites
+      every bit. Compared with Fiasco's Obj_space or Fuchsia's zx_handle
+      (S=3) the model is qualitatively weaker. A=2: in-tree opt-in feature of
+      the MPU port rather than a foundational design property. T_age=2 (v2
+      wrappers landed for V10.x, ~2-3 years stable as of V11.2.0),
+      T_maintained=3 (mpu_wrappers_v2.c is actively touched in upstream); T =
+      min(2,3) = 2.
+  C4.3:
+    P: 1
+    D: 2
+    S: 2
+    A: 3
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition; without it tasks run privileged and the SVC layer is bypassed)"
+      - "configUSE_MPU_WRAPPERS_V1=0 (selects the v2 layer with the SVC-number-bounded dispatch table; default for new MPU configs)"
+      - "NUM_SYSTEM_CALLS (compile-time bound on the syscall number range checked by SVC_Handler)"
+      source_files:
+      - "sources/freertos/include/mpu_syscall_numbers.h (SYSTEM_CALL_* numeric assignments — the entire kernel surface reachable from unprivileged mode is enumerated here)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c:5030 (uxSystemCallImplementations[NUM_SYSTEM_CALLS] — flat array; disabled APIs are nulled to (UBaseType_t)0 at compile time, so configUSE_TASK_NOTIFICATIONS=0 etc. literally remove syscalls)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/portasm.c:537 (SVC_Handler: extracts SVC immediate, dispatches to vSystemCallEnter for numbers < NUM_SYSTEM_CALLS, vSystemCallExit for the exit number, vPortSVCHandler_C for the few privileged-only SVCs)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:1205 (vSystemCallEnter: checks (1) PC of the SVC instruction is inside __syscalls_flash_start__/__syscalls_flash_end__, (2) the per-task system-call stack is idle, (3) the chosen syscall is not nulled out by config; only then raises privilege and dispatches into the table)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (each MPU_xFoo wrapper additionally re-validates the opaque handle index before forwarding into the real kernel function)"
+      default_state: >-
+        On the FreeRTOS-MPU posture every unprivileged task hits the kernel only
+        through the SVC instruction; the SVC handler is a single auditable entry
+        point that bounds the syscall number, verifies the SVC instruction
+        itself was issued from the linker-defined
+        __syscalls_flash_start__..__syscalls_flash_end__ region (i.e. from the
+        MPU_xFoo trampoline, not from an arbitrary task gadget), and only then
+        raises privilege and indexes into uxSystemCallImplementations. Disabling
+        a kernel facility in FreeRTOSConfig.h (configUSE_TIMERS=0,
+        configUSE_TASK_NOTIFICATIONS=0, configUSE_EVENT_GROUPS=0, …) nulls the
+        corresponding slots at compile time, deleting them from the attack
+        surface entirely. There is no equivalent of seccomp's per-task BPF
+        filter — the surface is shaped at build time, identically for every
+        unprivileged task in the image.
+    commits:
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1: FreeRTOS-MPU implements exactly the property C4.3 names — bounding
+      which kernel calls an unprivileged thread can issue. D=2: on the
+      documented MPU posture this is the default behaviour for any task
+      created without portPRIVILEGE_BIT; D is not 3 because the design choice
+      to put a task in unprivileged mode is the integrator's, and the flat
+      posture exposes everything. S=2: the SVC table plus the
+      __syscalls_flash_start..end pin and the per-handle ACL stack provide
+      strong, hardware-backed surface reduction, but the granularity is image-
+      wide (every unprivileged task in the build sees the same syscall set —
+      there is no per-task seccomp-bpf-style filter), and the privileged-side
+      checks are conventional C code with no formal verification, so we stop
+      short of S=3. A=3: the SVC trap, the syscall-flash linker section, and
+      the v2 wrapper layer are foundational to the FreeRTOS-MPU port — not
+      bolt-ons. T_age=3 (the SVC-mediated MPU surface and __syscalls_flash_*
+      sections have been part of the Cortex-M MPU ports for many years; v2
+      added the opaque-handle layer more recently), T_maintained=3
+      (mpu_wrappers_v2.c and the CM33 port SVC paths receive ongoing fixes);
+      T = min(3,3) = 3.
+  C4.5:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        There is no insmod, modprobe, dlopen-into-kernel, or runtime code
+        loading of any kind in FreeRTOS-Kernel V11.2.0. The build produces one
+        ELF/binary that contains the kernel, the application, and any drivers as
+        a single privileged-flash image (plus per-task unprivileged-flash
+        sections on the MPU port). Without a loader path the entire C4.5 attack
+        surface — 'load malicious kernel code at runtime' — does not exist.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A by design — there is no kernel-module loading mechanism, so there
+      is nothing to gate with signing, lockdown, or a securelevel-style
+      monotonic switch. This mirrors the framework's N/A treatment of
+      Fuchsia and Fiasco for the same mechanism
+      ("no loadable module support"). Replacing kernel code requires
+      reflashing the device image, which is a property of the boot/trust
+      chain (C6) rather than a runtime privilege-boundary concern.
+  C4.6:
+    P: 1
+    D: 2
+    S: 2
+    A: 3
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition)"
+      - "portNUM_CONFIGURABLE_REGIONS (number of MemoryRegion_t slots a TaskParameters_t carries — 4 on most Cortex-M targets, 8 on Armv8-M)"
+      - "configUSE_MPU_WRAPPERS_V1=0 (enables the per-task system-call stack and ACL bitmap)"
+      source_files:
+      - "sources/freertos/include/task.h:147 (TaskParameters_t: pvTaskCode, stack, xRegions[portNUM_CONFIGURABLE_REGIONS] of MemoryRegion_t — the analogue of a 'process descriptor with seccomp + memory regions' supplied at create time)"
+      - "sources/freertos/tasks.c:1571 (xTaskCreateRestricted: calls prvCreateRestrictedTask, which programs xMPU_SETTINGS from the supplied MemoryRegion_t array before the new task ever runs)"
+      - "sources/freertos/tasks.c (xMPU_SETTINGS embedded in TCB_t; loaded into MPU_RBAR/MPU_RLAR by vPortRestoreContextOfTask on each context switch)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c (prvSetupMPU + per-task region programming; per-task RAM regions are XN, RW only for the owning task)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (per-task system-call stack via xSystemCallStackInfo so one task's syscall execution cannot trample another's stack)"
+      default_state: >-
+        Each FreeRTOS-MPU task is its own isolation domain enforced by the
+        Armv8-M MPU: it gets its own RW+XN task RAM region, optionally up to
+        portNUM_CONFIGURABLE_REGIONS additional MemoryRegion_t slots (which the
+        integrator typically uses to grant access to specific device peripherals
+        or shared buffers), and — on v2 — its own kernel-side system-call stack
+        and ulAccessControlList[] bitmap. The MPU is reprogrammed from
+        xMPU_SETTINGS on every context switch, so a task cannot read or write
+        another task's RAM or peripherals it was not granted. There is no
+        analogue of Linux namespaces (no PID/net/mount namespace concept exists
+        because there are no PIDs/networks/mounts in the kernel), and no
+        FreeBSD-jail-style hierarchical container — the granularity is per-task
+        MPU regions, configured statically at task-create time.
+    commits:
+    - hash: "4640196be"
+      date: "2009-09-28"
+      description: "Add CM3 MPU port."
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1: the per-task isolation domain exists. D=2: enabled by default on
+      the MPU posture for any task created with xTaskCreateRestricted /
+      xTaskCreateRestrictedStatic; xTaskCreate also works under MPU but
+      defaults to a single shared unprivileged region per task without the
+      caller-customised MemoryRegion_t entries. S=2: the MPU hardware enforces
+      the per-task region permissions and the kernel-private region keeps TCBs
+      and scheduler state out of unprivileged reach, but the model is much
+      coarser than Linux namespaces or FreeBSD jails — only a handful of
+      configurable regions per task, no hierarchical isolation, no resource
+      accounting per domain, and a single kernel address space shared by all
+      privileged code, so a compromised privileged context escapes
+      immediately. A=3: per-task MPU programming and the xMPU_SETTINGS slot
+      inside TCB_t are foundational to FreeRTOS-MPU; xTaskCreateRestricted is
+      not retrofitted on top of a flat scheduler. T_age=3 (MemoryRegion_t and
+      xTaskCreateRestricted have been part of the MPU API for well over a
+      decade), T_maintained=3 (the Armv8-M port and tasks.c restricted-task
+      paths are actively maintained); T = min(3,3) = 3.
+  C4.7:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS tasks do not carry any user-identity metadata. TCB_t has no
+        uid/gid/effective-uid fields; there is no setuid/seteuid equivalent, no
+        exec boundary at which credentials could be inherited or dropped, no
+        Yama-style PTRACE_SCOPE because there is no ptrace, and no SUID dumpable
+        concept because there is no core-dump pipeline. The kernel does provide
+        vPortResetPrivilege and the symmetric vPortRaisePrivilege, but those
+        operate on the Armv8-M CONTROL.nPRIV bit of the currently running task
+        rather than on any persistent credential; they are an MPU-mode privilege
+        transition primitive, not a setuid-style credential operation. The C4.7
+        attack surface — 'attacker uses ptrace/SUID/credential APIs to escalate'
+        — does not exist.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — C4.7 hardens a Unix-shaped credential and process-relationship
+      model (uid/gid, setuid, ptrace, parent-child inheritance) that
+      FreeRTOS structurally does not have. There are no credentials to
+      sanitise on exec because there is no exec; there is no ptrace API to
+      gate with Yama; there is no SUID dumpable bit because there is no
+      core-dump pipeline. The closest analogues — the privilege-raise
+      gating in vSystemCallEnter, the per-task MPU regions, and the
+      optional ACL bitmap — are scored under C4.3 (syscall surface
+      reduction), C4.6 (process/resource isolation domains) and C4.2
+      (capability-based access control) respectively, so scoring C4.7
+      separately would double-count the same MPU mechanism. This matches
+      Fuchsia's "no ptrace concept" framing and Fiasco's "no
+      uid/gid in the kernel" treatment of the same mechanism.
+  C4.8:
+    P: 1
+    D: 2
+    S: 2
+    A: 3
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition)"
+      - "configUSE_MPU_WRAPPERS_V1 (both v1 and v2 perform the check; the check sits in vPortSVCHandler_C for v1 and in vSystemCallEnter for v2)"
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:1242 (vSystemCallEnter (v2): `if( ( ulSystemCallLocation >= ( uint32_t ) __syscalls_flash_start__ ) && ( ulSystemCallLocation <= ( uint32_t ) __syscalls_flash_end__ ) … )` — gates the entire syscall dispatch on the SVC PC being inside the carved region)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:1178 (vPortSVCHandler_C (v1) portSVC_RAISE_PRIVILEGE branch: same __syscalls_flash_start__/__syscalls_flash_end__ check before vRaisePrivilege)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (MPU_xFoo wrapper functions are tagged FREERTOS_SYSTEM_CALL so the linker places them in the __syscalls_flash_* section — they are the only legitimate origin for an SVC)"
+      default_state: >-
+        Every SVC trap from an unprivileged task is gated on the program counter
+        of the SVC instruction being inside the linker-defined
+        __syscalls_flash_start__..__syscalls_flash_end__ region, which contains
+        only the kernel-supplied MPU_xFoo trampolines. A task gadget that
+        executes its own `svc` instruction from inside its own
+        unprivileged-flash text region fails the check, vSystemCallEnter /
+        vPortSVCHandler_C returns without raising privilege, and the kernel
+        dispatch never happens. This is the same defensive intent as OpenBSD's
+        msyscall(2)/pinsyscalls — pinning the legitimate syscall-issuing
+        addresses — applied to the FreeRTOS-MPU surface where 'libc' is replaced
+        by the kernel-shipped wrapper stubs.
+    commits:
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1: the SVC origin check is implemented and exercised on every
+      unprivileged syscall. D=2: enabled by default on the FreeRTOS-MPU
+      posture; on flat mode the check is structurally inapplicable
+      because there is no privilege boundary. S=2: the check is enforced
+      by a privileged C predicate over the linker symbols
+      __syscalls_flash_start__/__syscalls_flash_end__, so its strength is
+      bounded by (a) the integrity of those linker symbols against a
+      kernel-side write primitive and (b) the absence of an SVC
+      instruction inside the carved region that the attacker could ROP
+      to with attacker-controlled R0..R3. The check is hardware-backed in
+      the sense that it relies on the architectural PC reading, but it is
+      not as strong as msyscall(2)'s page-table-encoded pin and not as
+      atomic as Fuchsia's vDSO mediation. A=3: an architectural property
+      of FreeRTOS-MPU's SVC entry path, not an opt-in mitigation. T_age=3
+      (the __syscalls_flash_* discipline has been in the port for many
+      years; v2 reuses the same primitive), T_maintained=3 (mpu_wrappers
+      and port SVC paths receive ongoing maintenance); T = min(3,3) = 3.
+      Note that the underlying linker carve-out and MPU permission
+      enforcement are shared with C1e.1 (W^X) and C1e.4 (PXN-equivalent);
+      C4.8 scores the policy use of those primitives.
+  C5a.1:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition for any task-level isolation)"
+      - "configENABLE_ACCESS_CONTROL_LIST (per-task allow-list of kernel objects, 0 by default; see include/FreeRTOS.h:83-85)"
+      source_files:
+      - "sources/freertos/tasks.c (xTaskCreateRestricted / xTaskCreateRestrictedStatic — the only API that turns a task into an MPU-confined 'driver'; integrator must opt in and supply the MemoryRegion_t entries pointing at the device MMIO range)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c (prvSetupMPU programs per-task regions on every context switch — region 0 stack guard, region 1 task RAM XN+RW, regions 2..N integrator-supplied)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (vGrantAccessToKernelObject / ulAccessControlList[] bitmap when configENABLE_ACCESS_CONTROL_LIST=1 — gates which kernel-object handles a 'driver' task may operate on)"
+      - "sources/freertos/include/FreeRTOS.h:83-85 (configENABLE_ACCESS_CONTROL_LIST default 0)"
+      default_state: >-
+        On the flat (no-MPU) posture every driver runs at the same privilege as
+        the scheduler, in one shared address space — a buggy driver corrupts
+        every other task's stack and every kernel data structure (a property the
+        C1e.5 entry already records). On the FreeRTOS-MPU posture there is a
+        usable, but entirely opt-in, sandbox: an integrator can write a driver
+        as a restricted task, give it only the MPU regions covering its MMIO and
+        DMA buffers, and (with configENABLE_ACCESS_CONTROL_LIST=1) restrict
+        which kernel objects it can touch. There is no built-in driver
+        registration mechanism that would force this discipline, no
+        restart-on-fault story, and DMA itself is unguarded because the Cortex-M
+        memory bus has no IOMMU (see C5c.1).
+    commits:
+    - hash: "4640196be"
+      date: "2009-09-28"
+      description: "Add CM3 MPU port."
+    - hash: "170a291d4"
+      date: "2023"
+      description: "Add Access Control List to MPU ports (#765)"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/765"
+    rationale: |
+      P=1: the MPU posture provides a real, hardware-enforced mechanism for
+      confining a driver to its MMIO range, its DMA buffer, and a bounded
+      syscall surface — this is materially more than the monolithic BSDs
+      offer for kernel drivers. D=1: the property is opt-in at every step
+      (configENABLE_MPU=1, xTaskCreateRestricted, MemoryRegion_t curation,
+      optional configENABLE_ACCESS_CONTROL_LIST); the kernel ships no
+      built-in driver model that would default a driver into the sandbox,
+      and no FreeRTOS driver framework (FreeRTOS-Plus-TCP, the IDE
+      examples) actually uses xTaskCreateRestricted in this way. S=1:
+      hardware-enforced for the unprivileged-task case, but the moment the
+      driver legitimately needs to enter privileged code (interrupt
+      handler, peripheral register write that touches NVIC) it executes
+      with full kernel privilege and the sandbox is gone — there is no
+      driver-fault containment, no restart, no IOMMU backstop on DMA, and
+      the integrator's discipline is the entire defence. A=2: the
+      mechanism (MPU regions, ACL bitmap) is part of the in-tree port but
+      the C5a.1 property itself (driver isolation as a design axis) is not
+      something the kernel architecture commits to. T_age=3 / T_maintained=3
+      → T=3: the underlying MPU/ACL primitives have been in the port for
+      many years and remain actively maintained.
+  C5a.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        There is no insmod/modprobe/dlopen-into-kernel path, no LKM ABI, no
+        module ELF loader, no module sysfs. The build produces one
+        privileged-flash image; updating any in-kernel logic requires reflashing
+        the device.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — there is no runtime loadable module to isolate. Matches the
+      framework's N/A treatment for Fuchsia, Fiasco, and OpenBSD on the same
+      mechanism. 'Extending' the kernel means
+      rebuilding the firmware image, which is a boot/trust-chain concern (C6)
+      rather than a runtime sandbox concern.
+  C5a.3:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        No eBPF, no uBPF, no Lua-in-kernel, no any other in-kernel interpreter
+        or code generator. The kernel runs only the C code that was linked into
+        the image at build time. Any scripting runtime, if present in an
+        application task, lives in user (unprivileged-task) space and is outside
+        the kernel TCB.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — no in-kernel VM to sandbox, so the C5a.3 attack surface is
+      structurally absent. Matches the framework's treatment of
+      OpenBSD/NetBSD/Fuchsia for the same mechanism.
+  C5b.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c (the kernel is the top of the privilege stack on the non-secure side; nothing above it can attest kernel text)"
+      default_state: >-
+        The Cortex-M (M-profile) architecture has no EL2 / no hypervisor
+        execution level, so the standard 'hypervisor enforces kernel-text RO'
+        design cannot exist on the same core. The TrustZone secure side (see
+        C5b.2) is sometimes used to host attestation or runtime-integrity
+        monitors in vendor stacks, but FreeRTOS-Kernel V11.2.0 itself ships no
+        such monitor and no in-tree API to request one. On A-profile multi-core
+        SoCs where FreeRTOS runs alongside Linux under a separate hypervisor,
+        the guard would belong to that hypervisor, not to FreeRTOS — and is
+        therefore not scored as a FreeRTOS-Kernel mechanism.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the Cortex-M profile structurally lacks the EL2 / hypervisor
+      execution level that HEKI/HVCI-style guards rely on, so the mechanism's
+      substrate does not exist on the evaluation target; this is an
+      architectural absence, not a gap a Kconfig flag could close. Tock and
+      zephyr record the identical structural situation as na ("no hypervisor
+      on Cortex-M"). The C6.4 'runtime kernel integrity' entry
+      separately scores the in-kernel self-protection primitives (MPU RO+X on
+      kernel flash) that survive without a hypervisor.
+  C5b.2:
+    P: 1
+    D: 1
+    S: 3
+    A: 3
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_TRUSTZONE (default 1 on the ARM_CM33 port; see include/FreeRTOS.h:3021-3024)"
+      - "configRUN_FREERTOS_SECURE_ONLY (default 0 — when 0, FreeRTOS is the non-secure scheduler and TrustZone is in effect; when 1, FreeRTOS itself runs in the secure world and the boundary is degenerate)"
+      - "secureconfigMAX_SECURE_CONTEXTS (default 8; secure_context.c:67 — bounds the number of non-secure tasks that may concurrently hold a secure-side execution context)"
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/secure/secure_init.c:63 (SecureInit_DePrioritizeNSExceptions: programs SCB_AIRCR.PRIS so non-secure exceptions are de-prioritised relative to secure ones — secure-world IRQs cannot be pre-empted by non-secure)"
+      - "sources/freertos/portable/GCC/ARM_CM33/secure/secure_context.c (per-task SecureContext_t pool: SecureContext_AllocateContext, SecureContext_LoadContext, SecureContext_FreeContext — separate secure-side PSP per non-secure task; stack-seal value 0xFEF5EDA5 placed at top and bottom of every secure stack to catch underflow/overflow per the Arm Cortex-M TrustZone guidance)"
+      - "sources/freertos/portable/GCC/ARM_CM33/secure/secure_heap.c (dedicated secure-side allocator that backs SecureContext_AllocateContext; secure-side state is never exposed to vPortMalloc on the non-secure side)"
+      - "sources/freertos/portable/GCC/ARM_CM33/secure/secure_port_macros.h (secureportNON_SECURE_CALLABLE attribute that marks the NSC entry-point veneers; secureportREAD_IPSR helper used to refuse secure-init requests from Thread Mode)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:1095-1163 (non-secure SVC dispatcher: portSVC_ALLOCATE_SECURE_CONTEXT and portSVC_FREE_SECURE_CONTEXT route into SecureContext_AllocateContext/SecureContext_FreeContext; portSVC_START_SCHEDULER calls SecureInit_DePrioritizeNSExceptions + SecureContext_Init)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/portasm.c:593 (vPortAllocateSecureContext: emits the SVC #portSVC_ALLOCATE_SECURE_CONTEXT instruction that crosses into the secure-side context manager)"
+      default_state: >-
+        On the ARM_CM33 port with configENABLE_TRUSTZONE=1 (the default) and
+        configRUN_FREERTOS_SECURE_ONLY=0 (the default), FreeRTOS is the
+        non-secure scheduler and the device is structurally divided by the
+        SAU/IDAU into a secure world (which holds long-lived secrets and exposes
+        only NSC veneers) and a non-secure world (which hosts the scheduler,
+        tasks, drivers, and TCP/IP stack). The kernel itself does not own any
+        secret material, but it integrates with the secure side in two
+        load-bearing ways: (a) at vTaskStartScheduler it calls
+        SecureInit_DePrioritizeNSExceptions so that the non-secure
+        PendSV/SysTick cannot pre-empt secure-world execution, and (b) it
+        manages per-task secure execution contexts (a private secure-side PSP,
+        stack-sealed at 0xFEF5EDA5 per Arm's recommendation) so that when task A
+        is mid-call into a secure NSC veneer and the scheduler context-switches
+        to task B, task A's secure state is preserved instead of being
+        overwritten by task B's secure call. The secure heap allocator that
+        backs these contexts is a separate allocator in the secure world;
+        non-secure code can never see it. There is no in-tree NTZ build for CM33
+        (portable/GCC/ARM_CM33_NTZ/ exists as a flat comparator that
+        intentionally omits the secure-side files); choosing that build is the
+        integrator's way of opting out of the TEE story altogether.
+    commits:
+    - hash: "ce576f368"
+      date: "2019"
+      description: "First Official Release of ARMV8M Support."
+    discussions: []
+    rationale: |
+      P=1: a real TEE-boundary integration ships in-tree (the entire
+      portable/GCC/ARM_CM33/secure/ tree plus the dedicated secure-side
+      SVC paths in non-secure/port.c). D=1 (not 2) because while
+      configENABLE_TRUSTZONE defaults to 1 in the CM33 port, the property
+      C5b.2 measures — actually placing key material on the secure side —
+      requires an application-provided secure image with NSC veneers
+      around the secrets; FreeRTOS-Kernel ships the scaffolding
+      (SecureContext_*, SecureInit_*, secure_heap) but not the keys, so
+      the out-of-box posture is "TrustZone wiring present, but no kernel
+      secrets being protected". An integrator who follows the
+      documentation and places, e.g., a TLS private key behind an NSC
+      veneer gets full S=3 isolation; an integrator who ignores
+      TrustZone gets nothing. S=3: when used as documented, the SAU/IDAU
+      boundary is hardware-enforced — a non-secure-world memory corruption
+      bug cannot read the secure-side heap or the secure-side stack of
+      another task, and de-prioritising non-secure exceptions prevents a
+      runaway non-secure scheduler from starving the secret-handling code.
+      A=3: the secure-side runtime (SecureContext_*, the per-task
+      SecureContext_t pool, the stack-seal discipline, the dedicated
+      secure_heap.c) is part of the CM33 port itself, not an add-on. T_age=3
+      / T_maintained=3 → T=3: the secure-side files have been in the
+      kernel since the CM33 port was introduced and remain actively
+      maintained. The honest caveat — that the *kernel* does not own
+      secrets, only the framework — is the reason D is 1 rather than 2.
+      Among the evaluated OSes this is the strongest TEE story by source-
+      tree integration depth; Linux's trusted_keys + TPM and Fuchsia's
+      TEE-relayed services achieve comparable runtime guarantees but
+      neither bakes the secure-side runtime into the kernel image.
+  C5c.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/secure/secure_init.c (secure-side TrustZone runtime programs only AIRCR.PRIS and FPU access via NSACR/FPCCR — no SAU region setup, no peripheral security attribution; the repo contains zero SAU references, so flash/RAM/peripheral attribution is left to integrator startup code)"
+      - "sources/freertos/portable/GCC/ARM_CM4_MPU/port.c (the only 'peripheral' regions are CPU-MPU regions over the 0x40000000-0x5FFFFFFF MMIO window, constraining CPU-issued accesses only; the Cortex-M CPU MPU does not police other bus masters)"
+      default_state: >-
+        The Armv8-M architecture has no system MMU and no IOMMU. The CPU MPU
+        only constrains CPU-issued accesses; any DMA-capable peripheral (DMA
+        controllers, Ethernet MAC, USB) writes the address it was programmed
+        with directly onto AHB/AXI, bypassing the MPU. Vendor SoCs ship
+        peripheral firewalls (STM32 GTZC, Nordic SPU, NXP/Microchip MPC) and the
+        SAU can attribute peripheral ranges secure/non-secure, but all of that
+        is vendor HAL/board/integrator code — the kernel itself has no firewall
+        driver, no SAU programming, no DMA-mapping API, and no
+        dma_alloc_coherent-equivalent.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the abstract property is bounding device/DMA-master access, and
+      that attack surface is real on Cortex-M: DMA controllers, the Ethernet
+      MAC, and USB controllers are independent bus masters that bypass the
+      CPU MPU entirely. A "no IOMMU, so non-existent surface" reading would
+      conflate the strong IOMMU-class variant with the mechanism class as a
+      whole: (1) the DMA-bypass surface exists regardless of whether an IOMMU
+      does, and (2) zephyr ships SPU/GTZC peripheral partitioning in-tree,
+      proving the peripheral-firewall variant is deliverable by an MCU OS.
+      Verified in tree: the secure runtime (secure_init.c) never touches the
+      SAU; the MPU ports place only CPU-side regions over the MMIO window;
+      there is no peripheral-firewall driver or DMA-mapping API. Where such
+      firewalls are configured on real boards it is vendor HAL/startup code,
+      outside the evaluated artifact — the same artifact-boundary convention
+      applied to C6.1/C6.2 (delegation to SoC ROM / vendor code is an absence
+      of an OS-level mechanism, not inapplicability). D=S=A=T=0 follow from
+      P=0.
+  C5c.2:
+    P: 1
+    D: 2
+    S: 2
+    A: 3
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition; default 0)"
+      - "portNUM_CONFIGURABLE_REGIONS (typically 8 on Armv8-M, configurable; see port.c MPU programming)"
+      - "configUSE_MPU_WRAPPERS_V1=0 (selects the v2 wrappers; v2 adds a per-task system-call stack and the optional ACL bitmap)"
+      - "configENABLE_ACCESS_CONTROL_LIST (0 by default; when 1, per-task ulAccessControlList[] bitmap further restricts which kernel objects each task may use)"
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c (prvSetupMPU / prvSetupDefaultMPU: programs region 0 stack guard, region 1 task RAM XN+RW, regions 2..N integrator-supplied per-task regions on every context switch)"
+      - "sources/freertos/tasks.c (xMPU_SETTINGS embedded inside TCB_t; loaded into MPU registers on context switch via vPortRestoreContextOfTask)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (per-task system-call stack via xSystemCallStackInfo, plus ulAccessControlList[] when configENABLE_ACCESS_CONTROL_LIST=1)"
+      - "sources/freertos/include/task.h (TaskParameters_t.xRegions[portNUM_CONFIGURABLE_REGIONS] — the user-facing per-task region table supplied at xTaskCreateRestricted time)"
+      default_state: >-
+        On the FreeRTOS-MPU posture the MPU is the architectural primitive for
+        intra-task isolation. Each task gets its own MemoryRegion_t[] enforced
+        by the MPU on every context switch — a task can only read/write the RAM
+        and MMIO regions enumerated for it, and any access outside those regions
+        traps as a MemManage fault. Compared with the BULKHEAD design point
+        (PKS-based domains inside a single PMD on x86), the FreeRTOS MPU
+        equivalent is coarser (handful of regions per task, region permissions
+        are static once programmed) but strictly hardware-enforced rather than
+        relying on a software invariant. Privileged code shares one address
+        space, so the property only constrains lateral movement at the
+        unprivileged-task level; once an attacker is in privileged mode the MPU
+        is fully reprogrammable. On the flat (no-MPU) posture there are no
+        protection domains at all.
+    commits:
+    - hash: "ce576f368"
+      date: "2019"
+      description: "First Official Release of ARMV8M Support."
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1: per-task MPU domains are implemented and exercised on every
+      context switch. D=2: enabled by default on the FreeRTOS-MPU posture
+      for any task created via xTaskCreateRestricted; the broader posture
+      itself is opt-in (configENABLE_MPU=1) which is why D is not 3. S=2:
+      hardware-enforced for unprivileged tasks, with the ACL bitmap layered
+      on top for kernel-object access — but the privileged side is one
+      shared domain, the region count per task is small (typically 8),
+      regions are statically sized at task-create time (not dynamically
+      grown the way Linux PKS keys are), and there is no compartment-switch
+      cost story (the MPU is reprogrammed wholesale on every context
+      switch, which is the same cost whether you use intra-task isolation
+      or not). A=3: per-task MPU programming and xMPU_SETTINGS-in-TCB are
+      foundational properties of the FreeRTOS-MPU port, not a bolt-on; the
+      same primitive backs C1e.1, C1e.4, C1e.5, C4.6, and C5d.2. T_age=3 /
+      T_maintained=3 → T=3: the MPU API has been part of the port for
+      well over a decade and remains actively maintained.
+  C5c.3:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Memory Tagging Extension is unavailable on every Cortex-M part shipped
+        to date, and the FreeRTOS Cortex-M ports contain no MTE code paths. The
+        C5c.3 hardware primitive simply does not exist on the platform. The
+        taxonomy hint already records this directly ('N/A on Cortex-M (no
+        MTE)').
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — hardware unavailable on the target architecture, mirroring the
+      framework's N/A treatment of every x86-64 OS for this row.
+      Even if a hypothetical M-profile MTE existed,
+      FreeRTOS would have no place to use it for inter-task tag-domain
+      separation, because the per-task RAM regions are already MPU-isolated.
+  C5d.1:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options: []
+      source_files:
+      - "sources/freertos/tasks.c (the scheduler proper — scheduling, idle task, task lifecycle)"
+      - "sources/freertos/queue.c (queues + the message-passing primitive that doubles as semaphores/mutexes)"
+      - "sources/freertos/list.c (intrusive lists used for ready/delayed/blocked task tracking)"
+      - "sources/freertos/timers.c (software timer service task)"
+      - "sources/freertos/event_groups.c + sources/freertos/stream_buffer.c (additional in-kernel IPC primitives)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (the MPU wrapper layer — itself part of the kernel, not a separate service)"
+      default_state: >-
+        The 'kernel' is reduced to scheduling, lists, queues, timers, and the
+        MPU SVC dispatch — a code base under 10 KSLOC of C. By that line count
+        the FreeRTOS scheduler core is one of the smallest in the evaluation
+        set, comparable to Fiasco's microkernel proper. But unlike a true
+        microkernel, FreeRTOS does not run the rest of the system (drivers, TCP
+        stack, file system) in separate protection domains: those components are
+        compiled and linked into the same privileged image as ordinary C objects
+        and share the kernel's address space. The MPU sandbox only separates
+        *application tasks* from the privileged image; it does not separate the
+        TCP/IP task from the scheduler, and there is no IPC mechanism between
+        protection domains besides direct C calls through the MPU SVC wrappers.
+    commits:
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1: the scheduler-vs-rest separation in source-tree structure is
+      real — the kernel proper is genuinely a small set of files under
+      sources/freertos/{tasks,queue,list,timers,event_groups,stream_buffer}.c,
+      with everything else (FreeRTOS-Plus-*, drivers, vendor HALs) shipped
+      as external repositories. D=1: there is no enforcement mechanism that
+      keeps services architecturally separate — an integrator who links
+      FreeRTOS-Plus-TCP and a vendor I2C driver into the same binary gets a
+      monolithic image, and that is the default workflow the documentation
+      describes. S=1: 'small TCB' is a real defensive property (less code,
+      fewer bugs), but a successful exploit anywhere inside the privileged
+      image touches the scheduler's data structures immediately because
+      they all share the same address space. A=2: the small-kernel design
+      is an intentional choice of the project (in-tree, stable for many
+      years) but is not architecturally enforced the way a microkernel's
+      task-per-service model is. T_age=3 / T_maintained=3 → T=3: the
+      file-level decomposition has been stable for over a decade. The
+      honest summary is that FreeRTOS is a small-kernel system but not a
+      microkernel, and the C5d.1 score reflects that gap.
+  C5d.2:
+    P: 1
+    D: 1
+    S: 2
+    A: 3
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition)"
+      - "configENABLE_ACCESS_CONTROL_LIST (default 0 — when 1, per-task allow-list of kernel-object handles)"
+      - "configUSE_MPU_WRAPPERS_V1=0 (v2 wrappers required for the per-task ACL bitmap and per-task syscall stack)"
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c (prvSetupMPU programs per-task RAM as RW+XN and kernel RAM as PRIV_RW; on context switch the previous task's regions are replaced wholesale, so a compromised task cannot see the next task's regions)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c (vGrantAccessToKernelObject + ulAccessControlList[] bitmap: a compromised task that holds a TaskHandle_t / QueueHandle_t still has to pass the per-task ACL check inside each MPU_xFoo wrapper before the kernel acts on the handle)"
+      - "sources/freertos/tasks.c (TCB_t holds xMPU_SETTINGS — including ulAccessControlList[] when the feature is enabled — so the per-task isolation state travels with the task, not with the global kernel)"
+      - "sources/freertos/include/FreeRTOS.h:83-85 (configENABLE_ACCESS_CONTROL_LIST default 0)"
+      default_state: >-
+        An unprivileged task on the FreeRTOS-MPU posture is confined to (a) its
+        own task RAM region (RW+XN), (b) any extra MemoryRegion_t entries
+        supplied at xTaskCreateRestricted time, and (c) the bounded SVC-dispatch
+        syscall surface analysed in C4.3/C4.8. A successful corruption inside
+        one such task cannot read or write another task's RAM and (with the ACL
+        on) cannot operate on kernel-object handles it does not own — the
+        analogue of preventing lateral movement between unprivileged components.
+        Inside the privileged image, however, there are no compartments: a
+        kernel-mode bug in any privileged code path (interrupt handler, MPU
+        wrapper itself, FreeRTOS-Plus-TCP if statically linked privileged, any
+        vendor HAL) reaches everywhere immediately.
+    commits:
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    - hash: "170a291d4"
+      date: "2023"
+      description: "Add Access Control List to MPU ports (#765)"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/765"
+    rationale: |
+      P=1: lateral-movement containment between unprivileged tasks is a
+      real, hardware-enforced property of the FreeRTOS-MPU posture. D=1:
+      MPU itself defaults to off; the ACL bitmap defaults to off
+      (configENABLE_ACCESS_CONTROL_LIST=0); and the property only holds at
+      the unprivileged-task level — so on the headline default posture
+      (flat, no MPU, every task privileged) nothing constrains lateral
+      movement at all. S=2 (one level above C5d.1's S=1 because there is
+      actual hardware enforcement, not just code-size minimalism, but
+      still capped because the privileged domain remains undivided): an
+      unprivileged-task compromise is genuinely contained — MPU traps any
+      out-of-region access, the ACL bitmap blocks unauthorised handle
+      operations, and the per-task syscall stack prevents one task's
+      privileged-side execution from clobbering another's — but a
+      privileged-mode compromise reaches everywhere. A=3: per-task MPU
+      regions, the ulAccessControlList[] bitmap, and the per-task syscall
+      stack are all foundational mechanisms of the MPU port and the v2
+      wrapper layer, not bolt-ons. T_age=3 / T_maintained=3 → T=3: the MPU
+      API, the wrappers, and the ACL extension are long-standing and
+      actively maintained. C5c.2 scores the primitive (per-task MPU
+      domains); C5d.2 scores how the kernel actually uses it as a lateral-
+      movement defence.
+  C6.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        The FreeRTOS-Kernel ships as portable C sources that the integrator
+        links into a single static firmware image. Verification of that
+        image (signature check, hash of the vector table, root-of-trust
+        anchored in immutable boot ROM) is performed before the kernel
+        executes by vendor stacks such as MCUboot, STM32 RDP/RSS, NXP
+        HABv4/AHAB, Microchip Secure Boot, or NordicSemi nRF Secure
+        Bootloader. The kernel itself contains no UEFI Secure Boot, no
+        signature-verification routine, and no kernel-side root-of-trust
+        primitive to score.
+    commits: []
+    discussions: []
+    rationale: >-
+      P=0: the boot-time tampering surface exists on every MCU deployment,
+      and the FreeRTOS distribution ships no verified-boot component — no
+      first-party bootloader, no signature verification, no root-of-trust
+      integration. Zephyr demonstrates an MCU OS can ship the mechanism
+      (CONFIG_BOOTLOADER_MCUBOOT, signed images, first-class west-manifest
+      integration), so delegating verification to SoC ROM / vendor stacks is
+      an absence of an OS-level mechanism, not inapplicability. D=S=A=T=0
+      follow from P=0.
+  C6.2:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        The kernel has no Trusted Platform Module or TCG-Storage driver and
+        no measured-boot infrastructure (no PCR extend on init, no event
+        log). On platforms that need measured boot, MCUboot or the vendor
+        ROM is responsible for hashing each stage and reporting it to an
+        external attestation back-end (e.g. AWS IoT Device Defender,
+        Azure DPS, or an on-die TrustZone-M secure partition); none of
+        that lives in the FreeRTOS-Kernel.
+    commits: []
+    discussions: []
+    rationale: >-
+      P=0: the measurement/attestation surface exists (firmware integrity
+      claims matter on any connected MCU), and the FreeRTOS distribution
+      ships nothing for it — no measurement at boot, no event log, no
+      attestation client. Zephyr scores P=1 here via its TF-M PSA attestation
+      integration, proving the mechanism is deliverable by an MCU OS;
+      FreeRTOS's delegation to vendor bootloaders is an absence, not
+      inapplicability. D=S=A=T=0 follow from P=0.
+  C6.3:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS has no loadable-module loader (C4.5 is N/A) and no
+        in-kernel attestation client. Remote attestation, where used in
+        Cortex-M deployments, is an application-level concern layered on
+        TLS (mbedTLS) and platform services such as AWS IoT Device
+        Defender, Arm Platform Security Architecture (PSA) attestation
+        running in the secure partition, or vendor DICE/RIoT
+        implementations in immutable ROM — none of these are kernel
+        primitives.
+    commits: []
+    discussions: []
+    rationale: >-
+      N/A by construction: no runtime-loaded kernel code to sign and no
+      kernel-side attestation primitives. Attestation, when present, is a
+      ROM- or application-level service.
+  C6.4:
+    P: 1
+    D: 2
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configENABLE_MPU=1 (precondition; the RO programming is in the configENABLE_MPU guard in port.c)"
+      - "configTOTAL_MPU_REGIONS (8 or 16 on Cortex-M33; the 4 background regions consume 4 of these)"
+      source_files:
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:940-944 (prvSetupMPU: privileged-flash region programmed with portMPU_REGION_PRIVILEGED_READ_ONLY using __privileged_functions_start__/__privileged_functions_end__ linker symbols)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c:967-974 (prvSetupMPU: privileged-RAM region programmed with portMPU_REGION_PRIVILEGED_READ_WRITE | portMPU_REGION_EXECUTE_NEVER — kernel data cannot be executed)"
+      default_state: >-
+        On the FreeRTOS-MPU posture (configENABLE_MPU=1, documented default for
+        this evaluation), the kernel's own .text section is marked read-only by
+        the MPU before the scheduler starts, and the kernel's privileged RAM is
+        marked execute-never. A stray privileged-mode write to a kernel-code
+        address therefore traps as a MemManage fault, and a stray jump into
+        kernel data traps the same way. There is no runtime API to *re-lock*
+        these regions or to monotonically raise a protection level: the MPU
+        registers remain writable from privileged mode for the life of the
+        system, so a privileged-mode arbitrary-write primitive can reprogram the
+        MPU and remove the protection. This is the structural equivalent of
+        CONFIG_STRICT_KERNEL_RWX without the additional CONFIG_LOCK_DOWN_KERNEL
+        / Lockdown-LSM monotonic-securelevel layer; closer in spirit to Linux's
+        pre-Lockdown state than to OpenBSD's monotonic kern.securelevel.
+    commits:
+    - hash: "ce576f368"
+      date: "2019"
+      description: "First Official Release of ARMV8M Support."
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1: the kernel's own .text and RAM are MPU-protected against accidental
+      and bug-driven modification at runtime. D=2: enabled by default on the
+      documented FreeRTOS-MPU posture but absent on the kernel's own
+      configENABLE_MPU=0 default; D is therefore not 3. S=2: hardware-enforced
+      against unprivileged tasks and against accidental kernel writes, but the
+      MPU remains reprogrammable from privileged mode for the system's life —
+      there is no monotonic-securelevel / Lockdown-LSM equivalent that would
+      freeze the protection so a kernel-code-execution bug cannot lift it.
+      Compared with OpenBSD's monotonic kern.securelevel (S=3) or Linux's
+      Lockdown LSM (S=2-3), the FreeRTOS primitive is closer to the bare
+      CONFIG_STRICT_KERNEL_RWX layer without the lockdown monotonic. A=2: an
+      in-tree configurable feature of the MPU port. T_age=3 / T_maintained=3 →
+      T=3: prvSetupMPU's RO-flash region has been part of the Cortex-M MPU
+      ports since the MPU port was introduced and is actively maintained.
+  C6.5:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        FreeRTOS has no filesystem-level integrity layer analogous to
+        IMA/EVM, IPE, fs-verity or Fuchsia's blobfs Merkle tree: tasks
+        execute from the same statically-linked image as the kernel, with
+        no load-time hash check. Signing/encryption of the final firmware
+        binary (when required) is a downstream step performed by the
+        integrator's vendor toolchain — MCUboot's imgtool, STMicro
+        STM32CubeProgrammer, NXP elftosb/SPSDK, Microchip MPLAB Code
+        Configurator — and is verified by the bootloader, not by the
+        kernel.
+    commits: []
+    discussions: []
+    rationale: >-
+      N/A: no kernel-side executable/object integrity verification exists,
+      and the kernel build itself does not sign or encrypt its output.
+      Image signing and on-flash encryption are bootloader/vendor-toolchain
+      concerns.
+  C7a.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        The Cortex-M33 pipeline is a 3-stage in-order scalar design with no
+        speculative execution past unresolved bounds checks. The kernel
+        therefore ships no array_index_nospec-style macros, no CSDB/SSBB
+        barriers at bounds-check sites, and no -mspeculative-load-hardening flag
+        in the portable/GCC/ARM_CM33* tree.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Spectre v1 (CVE-2017-5753) presupposes an out-of-order, speculative
+      pipeline that transiently issues bounded loads past a not-yet-resolved
+      compare. Armv8-M Mainline / Cortex-M33 has none of that microarchitectural
+      substrate, so the mechanism has no target to defend.
+  C7a.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        The Cortex-M33 branch predictor is structural (small BTAC) and does not
+        drive speculative execution of indirect-branch targets in the way x86
+        OoO cores do. There are no IA32_SPEC_CTRL-equivalent MSRs, no retpoline
+        thunk emission in the portable/GCC/ARM_CM33* ports, and no BHB-clearing
+        sequences.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Spectre v2 / BTI / Retbleed / BHI all depend on a misprediction
+      window driving an out-of-order pipeline. The retpoline and IBRS/IBPB
+      mitigations are x86-64-specific microcode/codegen contracts. Cortex-M33
+      offers neither the substrate nor the mitigation surface.
+  C7a.3:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Cortex-M33 retires stores in program order from an in-order pipeline and
+        does not speculatively forward older stores past unresolved address
+        calculations. The kernel ships no SSBD-equivalent toggle and no per-task
+        prctl interface.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Spectre v4 (CVE-2018-3639) requires speculative store-bypass in an
+      out-of-order memory pipeline. The Armv8-M Mainline profile defines no
+      such speculation, so the IA32_SPEC_CTRL.SSBD-style mitigations have
+      nothing to gate.
+  C7a.4:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Straight-line speculation is an Arm Cortex-A / x86-OoO phenomenon in
+        which the front end fetches and speculatively executes instructions
+        sequentially past an unconditional RET/BR. The Cortex-M33 in-order front
+        end does not exhibit this behaviour, and the kernel build emits no
+        -mharden-sls equivalent or speculation-barrier padding.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — SLS (CVE-2021-26341) targets cores with deep speculative fetch
+      beyond unconditional branches. Armv8-M Mainline / Cortex-M33 has neither
+      the fetch depth nor the speculative-execution machinery, so the
+      mitigation has no analogue here.
+  C7b.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Meltdown (CVE-2017-5754) relies on an OoO core dereferencing a
+        privileged address speculatively before the page-fault check retires.
+        Cortex-M33 retires faults in-order on the offending instruction, so
+        transient kernel reads from unprivileged tasks are not possible. The
+        kernel correspondingly ships no KPTI-equivalent (see also C3b.1).
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the Meltdown attack model is constructively impossible on an
+      in-order pipeline that resolves the permission check before any
+      dependent micro-op can populate the cache. FreeRTOS on Cortex-M33
+      therefore has no need for the PTI-class isolation that this mechanism
+      cross-references.
+  C7b.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        L1TF / Foreshadow (CVE-2018-3615) exploits an Intel-specific bug where a
+        not-present PTE's physical-frame bits are still used to speculatively
+        fetch data from the L1D. Cortex-M33 has no such speculative TLB/L1
+        interaction, typically no L1 D-cache at all on the common SKUs, and the
+        kernel ships neither PTE-inversion code nor any L1D-flush primitive
+        (there is also no KVM-like guest-entry path).
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — L1TF is an Intel x86 microarchitectural defect with no analogue in
+      the Armv8-M Mainline profile. FreeRTOS additionally does not run nested
+      guests, so the conditional L1D-flush half of the Linux mitigation has no
+      callers either.
+  C7c.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        MDS / TAA / MMIO-stale-data are Intel-specific leaks of fill-buffer,
+        store-buffer, and load-port contents through transient execution.
+        Cortex-M33 has none of those buffers exposed via speculative paths, and
+        the instruction-set has no VERW-equivalent buffer-clearing operation.
+        The kernel issues no buffer-clearing on context-switch or exception
+        return.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the MDS family of attacks targets Intel-specific internal buffers
+      that Cortex-M33 simply does not have, and the VERW-with-segment-operand
+      microcode contract is x86-only. There is nothing for FreeRTOS to clear.
+  C7c.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        Armv8-M Mainline cores execute one hardware thread per core; there is no
+        simultaneous-multi-threading and therefore no cross-thread sharing of
+        branch-predictor or speculation state to isolate. The kernel exposes no
+        STIBP-equivalent MSR and no SMT-disable toggle.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — STIBP and the SMT-disable mitigation exist specifically to keep
+      sibling hardware threads from poisoning each other's indirect-branch
+      predictors. Cortex-M33 has no sibling threads, so the attack model and
+      its mitigations are both inapplicable.
+  C5e.1:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configCHECK_FOR_STACK_OVERFLOW (default 0 — opt-in stack-overflow detection; cross-ref C1a.1)"
+      - "configUSE_MALLOC_FAILED_HOOK (default 0 — opt-in callback when pvPortMalloc returns NULL; include/FreeRTOS.h:93-94)"
+      - "INCLUDE_vTaskDelete (gates the vTaskDelete teardown primitive)"
+      source_files:
+      - "sources/freertos/tasks.c:5153,5254 (taskCHECK_FOR_STACK_OVERFLOW() invoked on every context switch when the check is enabled — the detection trigger)"
+      - "sources/freertos/include/stack_macros.h:77,94,116,141 (the check calls vApplicationStackOverflowHook(), which the application must supply and which decides what to do)"
+      - "sources/freertos/portable/MemMang/heap_4.c:336-347 (allocation failure returns NULL and, only if configUSE_MALLOC_FAILED_HOOK==1, calls the app-provided vApplicationMallocFailedHook — graceful failure, app-chosen response)"
+      - "sources/freertos/tasks.c:2213 (vTaskDelete — the kernel-provided teardown primitive an application's fault handler can call to remove a faulting task)"
+      - "sources/freertos/portable/GCC/ARM_CM33/non_secure/port.c (no MemManage_Handler / HardFault_Handler is defined here — a whole-port grep finds none; on an MPU access violation the application's fault vector runs, and containment/restart is entirely the integrator's code)"
+      default_state: >-
+        On the evaluated MPU baseline the kernel offers fault *detection* hooks
+        but no fault *recovery*: configCHECK_FOR_STACK_OVERFLOW defaults to 0
+        (and on the MPU port the software check is itself superseded by the
+        Armv8-M PSPLIM register — see C1a.1), configUSE_MALLOC_FAILED_HOOK
+        defaults to 0 so the default behaviour on heap exhaustion is a silent
+        NULL return that the caller must check, and the MemManage fault on an
+        unprivileged task's access violation is delivered to an
+        application-supplied handler because the kernel ships none. vTaskDelete
+        exists so an application fault handler *can* contain a faulting task,
+        but the kernel never invokes it automatically. There is no
+        soft/hard-lockup detector, no hung-task detector, and no kernel
+        self-watchdog; the only liveness backstop — a hardware watchdog — is
+        board/application code outside the FreeRTOS-Kernel tree.
+    commits:
+    - hash: "39f6b0b5d"
+      date: "2008-03-03"
+      description: "Add stack check macros."
+    - hash: "4640196be"
+      date: "2009-09-28"
+      description: "Add CM3 MPU port."
+    discussions: []
+    rationale: |
+      P=1: the kernel does ship fault-handling primitives — overflow-detection
+      hooks, a graceful NULL-return allocation-failure path, the MPU MemManage
+      trap that catches an unprivileged task's access violation, and vTaskDelete
+      to tear a faulting task down. D=1: every one of these is opt-in or
+      app-defined — configCHECK_FOR_STACK_OVERFLOW and configUSE_MALLOC_FAILED_HOOK
+      both default to 0, the stack/malloc hooks must be provided by the
+      integrator, and the MemManage handler that would turn a fault into a
+      restart is application code (the kernel defines none). S=1: there is no
+      kernel self-monitoring at all — no lockup/hung-task detector, no kernel
+      watchdog — so a hang or livelock inside privileged code is undetected, and
+      even the detection that exists hands off to application code that decides
+      (and may do nothing); the containment unit is the unprivileged task, and a
+      privileged-side fault is uncontained. A=2: the detection hooks, the
+      MemManage trap, and vTaskDelete are genuine in-tree features layered on the
+      scheduler and the MPU port, but fault containment is not a core design
+      property of the kernel the way it is in a microkernel with a per-component
+      fault-handler endpoint. T_age=3 (the stack-check macros date to 2008 and
+      vTaskDelete/the MPU trap are similarly long-standing) and T_maintained=3
+      (tasks.c, the heap allocators, and the CM33 port are actively maintained);
+      T = min(3,3) = 3. This sits at/just below openbsd C5e.1 (P=1 D=1 S=1 A=2 T=3,
+      panic-reboot default-on, no detectors): FreeRTOS matches openbsd's "detection
+      present, recovery weak, no detectors" shape but its default-posture recovery
+      is even more app-dependent (no kernel-default reboot-on-fault), so the D=1/S=1
+      pairing is the consistent placement; both sit well below linux (P=1 D=2 S=2 T=3,
+      which ships always-on lockup/hung-task detectors and a watchdog framework).
+  C5e.2:
+    P: 1
+    D: 2
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configUSE_PREEMPTION (no default — mandatory #error if undefined; include/FreeRTOS.h:180-181. The evaluated baseline is a preemptive config)"
+      - "configUSE_TIME_SLICING (default 1 — round-robins equal-priority ready tasks on each tick; include/FreeRTOS.h:2749-2750)"
+      - "INCLUDE_vTaskPrioritySet (gates the priority-set API; the wrapper is privileged-only regardless)"
+      source_files:
+      - "sources/freertos/include/FreeRTOS.h:2749-2750 (#ifndef configUSE_TIME_SLICING → default 1)"
+      - "sources/freertos/tasks.c (fixed-priority preemptive scheduler: highest-priority ready task always runs; equal-priority tasks round-robin under configUSE_TIME_SLICING)"
+      - "sources/freertos/include/mpu_syscall_numbers.h (the complete 70-entry SVC syscall table: uxTaskPriorityGet is number 7, but there is NO SYSTEM_CALL_vTaskPrioritySet — priority *elevation* is not reachable from an unprivileged task; only the read-only getter is)"
+      - "sources/freertos/portable/Common/mpu_wrappers_v2.c:1679 (MPU_vTaskPrioritySet is annotated PRIVILEGED_FUNCTION and has no ...Impl SVC-dispatch variant, so it can only be invoked from already-privileged code — an unprivileged task that calls it traps rather than elevating)"
+      default_state: >-
+        The scheduler is fixed-priority preemptive: the highest-priority ready
+        task always runs, and equal-priority ready tasks share the CPU
+        round-robin via time-slicing (configUSE_TIME_SLICING=1 by default). This
+        bounds starvation *among peers of equal priority* and lets a
+        higher-priority watchdog/supervisor task always preempt a runaway
+        lower-priority task. On the MPU baseline the fairness is enforceable
+        against a hostile task: vTaskPrioritySet, vTaskSuspendAll, and
+        vTaskDelete are all privileged-only (absent from the SVC syscall table
+        in mpu_syscall_numbers.h and lacking an ...Impl dispatch stub), so a
+        compromised unprivileged task cannot promote itself to the top priority
+        to monopolise the core. What is missing is any *budget* enforcement:
+        there is no per-task CPU-time quota, no bandwidth cap (cf. Linux cgroup
+        cpu.max), and no admission control — a malicious or buggy task running
+        at or above its peers' priority can still consume 100% of its
+        time-slices indefinitely, and a high-priority task can starve everything
+        below it by design.
+    commits:
+    - hash: "4e9374ad9"
+      date: "2013-06-06"
+      description: "Add default value for configUSE_TIME_SLICING"
+    - hash: "97050a17a"
+      date: "2023-07-13"
+      description: "Memory Protection Unit (MPU) Enhancements (#705) — introduces mpu_wrappers_v2 with opaque kernel object handles, per-task privileged syscall stack, and memory bounds checks (xPortIsAuthorizedToAccessBuffer). Shipped in V10.6.0"
+    discussions:
+    - "https://github.com/FreeRTOS/FreeRTOS-Kernel/pull/705"
+    rationale: |
+      P=1: the kernel provides a temporal-isolation primitive — a fixed-priority
+      preemptive scheduler with default-on time-slicing — and, on the evaluated
+      MPU baseline, the primitive is actually *enforceable* against a compromised
+      task because priority elevation (vTaskPrioritySet) is privileged-only and
+      unreachable from the unprivileged-task SVC surface (verified: no
+      SYSTEM_CALL_vTaskPrioritySet in mpu_syscall_numbers.h, no ...Impl dispatch
+      stub in mpu_wrappers_v2.c). D=2: time-slicing is default-on
+      (configUSE_TIME_SLICING=1) and the baseline is a preemptive configuration,
+      so the fairness behaviour is the default in the evaluated config (not merely
+      an opt-in knob). S=1: this is priority-based fairness, not a CPU-budget/
+      bandwidth cap — there is no per-task time quota, no admission control, and
+      no equivalent of Linux's hierarchical cpu.max or RT-throttling; a task that
+      is at or above its peers' priority can still consume the CPU indefinitely
+      and a high-priority task starves lower ones by design, so the protection
+      against CWE-400 CPU-starvation is weak. A=2: the preemptive scheduler and
+      the privileged-only priority API are in-tree design properties (the MPU
+      syscall split that makes elevation privileged-only is the same primitive
+      C4.3 scores), but there is no dedicated CPU-budget-enforcement architecture.
+      T_age=3 (the time-slicing default dates to 2013 and the preemptive scheduler
+      is far older) and T_maintained=3; T = min(3,3) = 3. This sits below both
+      openbsd C5e.2 (P=1 D=2 S=1 A=1 T=3 — RLIMIT_CPU actually *kills* a runaway
+      process, a real if coarse budget) and well below linux C5e.2 (P=1 D=2 S=2
+      A=2 T=3 — hierarchical bandwidth + admission control): FreeRTOS shares the
+      D=2 default-on placement but its S=1 reflects that it offers fairness only,
+      with no budget that bounds a single task's total CPU consumption. A=2 (vs
+      openbsd's A=1) credits that the enforceability rests on the architectural
+      MPU privilege split, not merely on scheduler priorities.
+  C5e.3:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "configSUPPORT_STATIC_ALLOCATION (default 0 — when 1, *Static object-creation APIs let the application pre-allocate all kernel objects, with no runtime heap use; include/FreeRTOS.h:2819-2821)"
+      - "configSUPPORT_DYNAMIC_ALLOCATION (default 1 — the evaluated default; pvPortMalloc from the shared heap; include/FreeRTOS.h:2828-2830)"
+      - "configTOTAL_HEAP_SIZE (fixed compile-time size of the heap_4/heap_5 arena — the only bound on total dynamic memory; image-wide, not per-task)"
+      source_files:
+      - "sources/freertos/portable/MemMang/heap_4.c (single shared first-fit arena of configTOTAL_HEAP_SIZE bytes; every task draws from the same pool with no per-task accounting or limit)"
+      - "sources/freertos/portable/MemMang/heap_4.c:336-350 (exhaustion is graceful: pvPortMalloc returns NULL — no kill, no quota charge, no attribution of which task consumed the heap)"
+      - "sources/freertos/include/FreeRTOS.h:2819-2830 (configSUPPORT_STATIC_ALLOCATION default 0, configSUPPORT_DYNAMIC_ALLOCATION default 1)"
+      - "sources/freertos/tasks.c (xTaskCreateStatic and the other *Static creators consume caller-provided StaticTask_t + stack buffers, using no heap when the application provisions statically)"
+      default_state: >-
+        There is no runtime per-task resource quota of any kind: no equivalent
+        of Linux's memory.max/pids.max or RLIMIT_AS, no per-task heap
+        accounting, and no OOM-style attribution. In the default dynamic
+        configuration (configSUPPORT_DYNAMIC_ALLOCATION=1, heap_4) every task
+        allocates from one shared arena, so any single task can exhaust the heap
+        and deny allocations to all others; the only thing that happens is
+        pvPortMalloc returns NULL and well-written callers degrade gracefully.
+        The kernel's actual defence against resource exhaustion is structural
+        and opt-in: (a) configTOTAL_HEAP_SIZE caps total dynamic memory at a
+        fixed compile-time bound, and (b) configSUPPORT_STATIC_ALLOCATION
+        (default off) lets the integrator allocate every task, queue, semaphore
+        and timer from caller-supplied static buffers at build time, so a
+        fully-static image has no runtime heap to exhaust at all. Both are
+        image-wide design decisions, not per-principal quotas.
+    commits:
+    - hash: "210b1ffcc"
+      date: "2020-02-10"
+      description: "Re-sync with upstream and stripping away none kernel related. (static-allocation support predates this squashed history baseline)"
+    discussions: []
+    rationale: |
+      P=1: a resource-exhaustion defence exists in some form — configTOTAL_HEAP_SIZE
+      caps total dynamic memory at a fixed compile-time bound, and
+      configSUPPORT_STATIC_ALLOCATION lets the application eliminate the runtime
+      heap entirely by provisioning every kernel object statically. The exhaustion
+      surface is present in the default dynamic config, so this is P=1 rather than
+      na (see fork_notes). D=1: the strong form (fully-static provisioning) is
+      opt-in and off by default (configSUPPORT_STATIC_ALLOCATION=0); the evaluated
+      default uses dynamic heap_4, whose only bound is the image-wide
+      configTOTAL_HEAP_SIZE. S=1: the protection is weak as a *quota* mechanism —
+      there is no per-task limit, no accounting, and no attribution, so in the
+      default config any task can exhaust the shared heap and starve every other
+      task; the bound is on the whole image, not on the offending principal, and
+      graceful NULL-return is mitigation-by-caller-discipline, not enforcement.
+      A=2: the fixed-arena allocator and the static-allocation creators are in-tree
+      design choices (the same allocator family scored at C1b.2), but a per-task
+      resource-quota framework is simply not part of the architecture. T_age=3
+      (static allocation and the bounded heap are long-standing — see fork_notes on
+      the squashed history) and T_maintained=3 (the heap allocators are actively
+      maintained); T = min(3,3) = 3. This sits below both openbsd and linux C5e.3
+      (each P=1 D=2 S=2 A=2 T=3, which provide real per-principal limits —
+      setrlimit RLIMIT_AS / login.conf classes and cgroup memory.max+pids.max
+      respectively): FreeRTOS has only an image-wide bound and an opt-in static
+      mode, with no per-task quota, hence D=1/S=1. Cross-RTOS, this is the same
+      P=1 band as zephyr (fixed-size resource pools) and tock (MPU-bounded grant
+      region per process); FreeRTOS is weaker than tock here because tock's grant
+      is a genuine per-process bound whereas FreeRTOS's heap is shared with no
+      per-task cap.
+  C7d.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: >-
+        The evaluated target is a single-core Cortex-M33. There is no shared
+        multi-level cache contended between concurrently-live security domains
+        (no SMT sibling, no second core sharing an LLC), so the cross-domain
+        cache-timing channel that C7d.1 partitions does not arise. Cortex-M
+        parts commonly have only small, optionally-present caches and no
+        architectural cache-allocation/way-partitioning facility (no resctrl/CAT
+        analogue), and the FreeRTOS Cortex-M ports contain no cache-colouring,
+        no flush-on-context-switch for side-channel reasons, and no
+        page-colouring (there is no MMU). The framework's applicability rules
+        list FreeRTOS as N/A for C7d.1 on exactly these grounds.
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the time-protection / cache-partitioning attack surface requires a
+      shared multi-level cache contended across isolation domains, which the
+      single-core Cortex-M33 target does not have, and the M-profile ISA exposes
+      no cache-allocation primitive to partition with. This mirrors the
+      framework's N/A treatment of the other cacheless/single-core MCU targets
+      for this row (zephyr, contiki-ng, nuttx, tock all N/A) and matches the
+      taxonomy hint ("N/A — single-level cache / no shared LLC across domains").
+      Note this contrasts with openbsd's P=0 for C7d.1: on a server CPU the
+      shared-LLC surface exists (so absence of partitioning is P=0), whereas on
+      Cortex-M33 the surface itself is absent (N/A) — the same distinction the
+      framework draws between "surface exists → P=0" and "no shared multi-level cache
+      → N/A".

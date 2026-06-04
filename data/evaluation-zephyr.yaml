@@ -1,0 +1,1960 @@
+# yaml-language-server: $schema=schema/evaluation.schema.json
+# Zephyr RTOS kernel hardening evaluation.
+# Primary target: Zephyr v4.x main @ 80d912150 on ARMv8-M Cortex-M33 with
+# TrustZone-M and MPU (CONFIG_USERSPACE=y, CONFIG_ARM_TRUSTZONE_M=y,
+# CONFIG_BOOTLOADER_MCUBOOT=y, TF-M 2.1.0); sources at sources/zephyr/.
+# Comparators: Cortex-M4F (ARM_CORTEX_M4 port, no TZ, MPU optional);
+# RISC-V (rv32/rv64 port, PMP-based protection).
+os: zephyr
+schema_version: 1
+default_config: "Zephyr main @ 80d912150, ARMv8-M Cortex-M33 + TrustZone-M + MPU, CONFIG_USERSPACE=y, CONFIG_ARM_TRUSTZONE_M=y, CONFIG_BOOTLOADER_MCUBOOT=y, TF-M 2.1.0"
+comparator_configs:
+- "Cortex-M4F (ARM_CORTEX_M4 port, no TrustZone, MPU optional)"
+- "RISC-V (rv32/rv64 port, PMP-based protection)"
+
+mechanisms:
+
+  # =========================================================================
+  # C1 — Memory Corruption Prevention
+  # =========================================================================
+
+  C1a.1:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_STACK_CANARIES — default n; hardenconfig=y (kernel/Kconfig:801)"
+      - "CONFIG_STACK_CANARIES_STRONG — default n; hardenconfig=y (kernel/Kconfig:811)"
+      - "CONFIG_STACK_SENTINEL — default n; hardenconfig=y; depends on !USERSPACE && !MPU_STACK_GUARD (subsys/debug/Kconfig:118)"
+      - "CONFIG_HW_STACK_PROTECTION — default n; hardenconfig=y; selects BUILTIN_STACK_GUARD on M33 (arch/Kconfig:327)"
+      - "CONFIG_BUILTIN_STACK_GUARD — depends on CPU_CORTEX_M_HAS_SPLIM (Cortex-M33 satisfies this) (arch/arm/core/Kconfig:218)"
+      - "CONFIG_MPU_STACK_GUARD — selected when BUILTIN_STACK_GUARD not available (arch/arm/core/mpu/Kconfig:24)"
+      source_files:
+      - "sources/zephyr/arch/arm/core/Kconfig:218-241 (BUILTIN_STACK_GUARD, ARM_STACK_PROTECTION: selects BUILTIN_STACK_GUARD if CPU_CORTEX_M_HAS_SPLIM, else MPU_STACK_GUARD)"
+      - "sources/zephyr/kernel/Kconfig:801-857 (STACK_CANARIES choice with NONE/DEFAULT/STRONG/ALL/EXPLICIT levels; STACK_CANARIES_TLS for per-thread canary via TLS)"
+      - "sources/zephyr/subsys/debug/Kconfig:118-143 (STACK_SENTINEL magic 0xAA at stack bottom; 4 check points: context switch, IRQ, thread exit, k_yield)"
+      - "sources/zephyr/kernel/compiler_stack_protect.c (kernel SSP __stack_chk_fail handler)"
+      - "sources/zephyr/arch/arm/core/cortex_m/ (SVC/context-switch path where PSPLIM is saved/restored)"
+      default_state: >-
+        All three mechanisms are disabled by default. hardenconfig
+        (scripts/kconfig/hardened.csv) recommends STACK_CANARIES=y,
+        HW_STACK_PROTECTION=y, BUILTIN_STACK_GUARD=y, MPU_STACK_GUARD=y, and
+        STACK_SENTINEL=y (the last applies only in non-USERSPACE mode). Numerous
+        production boards (Nordic nRF52840, nRF5340, etc.) set
+        HW_STACK_PROTECTION=y in their Kconfig.defconfig.
+    commits:
+    - hash: "46f66f4295c"
+      date: "2017"
+      description: "kconfig: generalised stack protection options"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/1430"
+    rationale: |
+      P=1: Zephyr ships three stack-overflow detection mechanisms. D=1: all
+      require explicit Kconfig opt-in (hardenconfig recommends them; many
+      Nordic boards enable HW_STACK_PROTECTION by default). S=2: on Cortex-M33,
+      BUILTIN_STACK_GUARD programs PSPLIM/MSPLIM hardware registers that fire a
+      MemManage fault before the stack pointer crosses the guard boundary — this
+      is immediate hardware detection, not context-switch-bound. SSP canaries
+      add a compiler-level layer. Stack overflow before the PSPLIM line could
+      still corrupt the region between stack bottom and the guard, so S=3 is
+      not warranted. A=2: in-tree, Kconfig-configurable, integral to the
+      scheduler. T=3: stack protection has been in Zephyr since its earliest
+      releases (2017); T_age=3, T_maintained=3 (weekly release cadence).
+  C1a.2:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_HW_STACK_PROTECTION — default n; hardenconfig=y (arch/Kconfig:327)"
+      - "CONFIG_BUILTIN_STACK_GUARD — depends on CPU_CORTEX_M_HAS_SPLIM (Cortex-M33) (arch/arm/core/Kconfig:218)"
+      - "CONFIG_MPU_STACK_GUARD — explicit or fallback selection (arch/arm/core/mpu/Kconfig:24)"
+      - "CONFIG_MPU_STACK_GUARD_MIN_SIZE_FLOAT — minimum guard region 128 bytes with FPU_SHARING (arch/arm/core/mpu/Kconfig:29)"
+      source_files:
+      - "sources/zephyr/arch/arm/core/Kconfig:226-241 (ARM_STACK_PROTECTION: imply BUILTIN_STACK_GUARD if CPU_CORTEX_M_HAS_SPLIM; select MPU_STACK_GUARD otherwise)"
+      - "sources/zephyr/arch/arm/core/mpu/arm_mpu.c (MPU region programming, stack guard setup)"
+      - "sources/zephyr/arch/arm/core/cortex_m/ (PSPLIM/MSPLIM register save/restore on context switch)"
+      default_state: >-
+        Disabled by default in bare kernel config. Production boards (Nordic,
+        NXP Cortex-M33 families) commonly enable HW_STACK_PROTECTION in their
+        Kconfig.defconfig. With CONFIG_USERSPACE=y the MPU is already managing
+        per-thread regions, and MPU_STACK_GUARD is automatically effective as
+        the background region protects privileged data.
+    commits:
+    - hash: "46f66f4295c"
+      date: "2017"
+      description: "kconfig: generalised stack protection options"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/1430"
+    rationale: |
+      P=1: a guard-equivalent exists via PSPLIM hardware register (which fires
+      a MemManage fault the instant SP crosses the limit) plus the optional
+      MPU-region guard. D=1: opt-in by Kconfig; many production board defaults
+      enable it but the kernel itself does not. S=2: PSPLIM is hardware-enforced
+      and fires before any corruption of adjacent thread data; the MPU region
+      boundary provides a comparable trap. Unlike MMU guard pages there is no
+      slack of unmapped virtual address space — the protection boundary is the
+      MPU region edge itself with no gap, but the hardware still triggers
+      a fault immediately. A=2: in-tree Kconfig option. T=3: long-standing
+      feature in Zephyr (T_age=3, T_maintained=3).
+  C1a.3:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE — enables user-kernel copy validation (arch/Kconfig:340)"
+      source_files:
+      - "sources/zephyr/arch/arm/core/mpu/arm_core_mpu.c:367 (arch_buffer_validate implementation; MPU region check)"
+      - "sources/zephyr/arch/arm/core/userspace.S:615 (arch_user_string_nlen fault-safe string length)"
+      - "sources/zephyr/include/zephyr/internal/syscall_handler.h:242 (k_usermode_string_nlen wrapper; K_OOPS macro; per-syscall user pointer validation; copy_from_user/copy_to_user helpers)"
+      default_state: >-
+        Only active when CONFIG_USERSPACE=y, which is opt-in. When enabled,
+        every syscall handler validates user pointer arguments automatically via
+        arch_buffer_validate before dereferencing.
+    commits:
+    - hash: "945af95f421"
+      date: "2017"
+      description: "kernel: introduce object validation mechanism"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/1276"
+    rationale: |
+      P=1: arch_buffer_validate() provides systematic user-pointer bounds
+      checking tied to the MPU region model. D=1: gated on CONFIG_USERSPACE,
+      which is opt-in. S=2: the MPU domain model is used to validate pointer
+      ranges, covering the entire thread's permitted address space; it is
+      architecture-enforced and not bypassable from user mode. No separate
+      VMA walk is needed (MPU regions are the address space). A=2: in-tree,
+      integral to USERSPACE feature; not bolt-on. T=3: USERSPACE has been
+      in Zephyr since v1.6 (2017); T_age=3, T_maintained=3.
+  C1a.4:
+    P: 1
+    D: 2
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "FORTIFY_SOURCE_NONE — disabled; default when NO_OPTIMIZATIONS || MINIMAL_LIBC || NATIVE_BUILD"
+      - "FORTIFY_SOURCE_COMPILE_TIME — default for standard builds (Kconfig.zephyr:608-609)"
+      - "FORTIFY_SOURCE_RUN_TIME — opt-in; adds runtime checking (increases code size)"
+      source_files:
+      - "sources/zephyr/Kconfig.zephyr:606-636 (COMPILER_SECURITY_FORTIFY choice)"
+      default_state: >-
+        FORTIFY_SOURCE_COMPILE_TIME is enabled by default for any Zephyr build
+        using optimizations and Picolibc or Newlib. Only disabled when using
+        MINIMAL_LIBC, NO_OPTIMIZATIONS, or NATIVE_BUILD. FORTIFY_SOURCE_RUN_TIME
+        requires explicit opt-in.
+    commits:
+    - hash: "62bc9bf3e59"
+      date: "2022"
+      description: "cmake: Allow selection of libc API overflow detection mode"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/45598"
+    rationale: |
+      P=1: FORTIFY_SOURCE is supported and enabled by default for standard
+      builds. D=2: FORTIFY_SOURCE_COMPILE_TIME is the default for builds with
+      optimizations and Picolibc/Newlib (the normal production path). S=1:
+      compile-time FORTIFY catches obvious fixed-size buffer overflows at
+      build time but provides no protection against runtime-determined sizes;
+      runtime FORTIFY (=2) would raise this to S=2 but requires explicit
+      opt-in. A=2: integrated into the build system via Kconfig. T=3:
+      FORTIFY support in Zephyr has been present for several years;
+      T_age=3, T_maintained=3.
+  C1a.5:
+    P: 1
+    D: 1
+    S: 3
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_ASAN — Address Sanitizer (subsys/debug/Kconfig:29); native_sim only"
+      - "CONFIG_UBSAN — Undefined Behavior Sanitizer (subsys/debug/Kconfig:68); native_sim only"
+      - "CONFIG_MSAN — MemorySanitizer reference in heap.c"
+      source_files:
+      - "sources/zephyr/subsys/debug/Kconfig:29-90 (ASAN, UBSAN, ASAN_RECOVER, UBSAN_TRAP options)"
+      - "sources/zephyr/lib/heap/heap.c:16-18 (CONFIG_MSAN reference)"
+      default_state: >-
+        Disabled by default. Only usable with native_sim build target. Not
+        applicable to production Cortex-M firmware due to memory overhead and
+        runtime dependencies.
+    commits:
+    - hash: "91220ba6404"
+      date: "2018"
+      description: "boards: native_posix: Add option to build with Address Sanitizer"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/8714"
+    rationale: |
+      P=1: ASAN and UBSAN exist as Kconfig options and are used in Zephyr CI
+      and regression testing. D=1: opt-in, and practically restricted to
+      native_sim targets. S=3: AddressSanitizer provides comprehensive spatial
+      and temporal memory safety checking with near-complete coverage of
+      heap/stack out-of-bounds and use-after-free. A=2: in-tree, integrated
+      into the build system. T=3: sanitizer support has been present in
+      Zephyr for many years; T_age=3, T_maintained=3.
+  C1a.6:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — MTE (Memory Tagging Extension) is an ARMv9-A feature (Cortex-A510+,
+      Cortex-X2+). The primary evaluation target is ARMv8-M Cortex-M33 which
+      has no MTE hardware. Zephyr does not expose any MTE Kconfig for Cortex-M.
+  C1a.7:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_UBSAN — enables -fsanitize=undefined incl. array-bounds (subsys/debug/Kconfig:68); default n"
+      - "CONFIG_UBSAN_TRAP — trap-on-UB mode, runnable on Cortex-M (subsys/debug/Kconfig:90)"
+      - "CONFIG_UBSAN_LIBRARY — diagnostic mode; depends on ARCH_POSIX || PICOLIBC (subsys/debug/Kconfig:80)"
+      source_files:
+      - "sources/zephyr/subsys/debug/Kconfig:68-98 (UBSAN, UBSAN_LIBRARY, UBSAN_TRAP)"
+      - "sources/zephyr/CMakeLists.txt:391-401 (applies sanitizer_undefined flags when CONFIG_UBSAN)"
+      - "sources/zephyr/cmake/compiler/gcc/compiler_flags.cmake:219 (sanitizer_undefined = -fsanitize=undefined)"
+      default_state: >-
+        Disabled by default (CONFIG_UBSAN=n). No dedicated bounds-trap hardening
+        default exists; bounds checking only with full UBSAN, used on
+        native_sim/QEMU CI targets, not production Cortex-M33 builds.
+    commits: []
+    discussions: []
+    rationale: |
+      P=1: array-index bounds instrumentation exists in-tree as the array-bounds
+      subset of -fsanitize=undefined, enabled by CONFIG_UBSAN. D=1: opt-in
+      (default n) and, like C1a.5, practically confined to native_sim/QEMU dev
+      targets — there is no production bounds-trap hardening default (contrast
+      Linux C1a.7 D=2 where Fedora ships UBSAN_BOUNDS on; matches OpenBSD C1a.7
+      D=1 KUBSAN debug option). S=2: when enabled, the array-bounds checker
+      flags out-of-bounds indexing on objects of known size at the access site,
+      significantly raising the bar against CWE-129/CWE-787, but it only covers
+      compiler-visible constant-bounded accesses (no whole-program flow), so it
+      is not a complete eliminator — matches the OpenBSD C1a.7 S=2 anchor.
+      A=2: in-tree build-system option, not a core design property. T: the
+      Zephyr sanitizer toolchain integration (ASan/UBSan) dates to the 2018
+      native_posix sanitizer work (xref C1a.5 commit 91220ba6404), so T_age=3
+      (5+ years); the sanitizer flag plumbing in cmake/ and subsys/debug is
+      actively maintained, T_maintained=3. Effective T=min(3,3)=3. (Shallow
+      clone — git log is grafted/flattened and per-file history is unreliable;
+      T_age derived from the documented 2018 sanitizer-support feature history.)
+  C1b.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the use-after-free surface plainly exists — Zephyr has kernel heaps
+      (sys_heap/k_heap) and a UAF there hits immediately recycled memory — and
+      no allocator-level mitigation (quarantine, delayed reuse, type-stable
+      caches) is implemented. An OS with a kernel heap cannot be N/A for UAF
+      mitigation (hurd's zalloc heap and freertos's heap_4 are scored P=0 on
+      the same grounds); na is reserved for kernels with no heap at all
+      (tock). That the embedded heap design makes quarantine costly explains
+      the absence; it does not remove the surface. D=S=A=T=0 follow from P=0.
+  C1b.2:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 2
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "SYS_HEAP_HARDENING — choice; default MODERATE if ASSERT else BASIC (lib/heap/Kconfig:80-83)"
+      - "SYS_HEAP_HARDENING_FULL — selects SYS_HEAP_CANARIES (lib/heap/Kconfig:116)"
+      - "SYS_HEAP_CANARIES_RANDOM — randomizes canary base value (lib/heap/Kconfig:156)"
+      source_files:
+      - "sources/zephyr/lib/heap/heap.c:20-77 (chunk canary computation: compute_canary() XORs chunk ID rotation with chunk size and HEAP_CANARY_MAGIC; set_chunk_canary/verify_chunk_canary/poison_chunk_canary)"
+      - "sources/zephyr/lib/heap/Kconfig:80-165 (SYS_HEAP_HARDENING choice and SYS_HEAP_CANARIES_RANDOM)"
+      default_state: >-
+        BASIC by default (double-free + size checks, no canaries). With
+        CONFIG_ASSERT=y (common in development builds), MODERATE is selected,
+        adding free-list and neighbor-size consistency checks. FULL hardening
+        (canaries) requires explicit selection. SYS_HEAP_CANARIES_RANDOM
+        requires further explicit opt-in to randomize the canary base.
+    commits:
+    - hash: "fbe80ed506a"
+      date: "2026"
+      description: "lib: heap: add CONFIG_SYS_HEAP_CANARIES for corruption detection"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/103611"
+    rationale: |
+      P=1: sys_heap has a well-designed multi-level hardening system including
+      per-chunk canaries with optional random base. D=1: the default (BASIC)
+      provides only minimal protection; the meaningful FULL level with canaries
+      requires explicit CONFIG selection. S=2: FULL-level canaries detect
+      heap metadata corruption and double-free (poison value 0xDEADBEEF) on
+      any heap_free/realloc; the random-base option makes the canary value
+      unpredictable. A=2: in-tree, integrated in the primary heap allocator.
+      T=2: the SYS_HEAP_HARDENING system was introduced in the v3.x era
+      (approx 2022-2023); T_age=2, T_maintained=3.
+  C1b.3:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Zephyr's kernel object (kobject) system does not use reference
+      counting for object lifetime management. struct k_object
+      (include/zephyr/sys/internal/kobject_internal.h:61-66) uses a permission
+      bitmap (perms[CONFIG_MAX_THREAD_BYTES]) rather than a reference count.
+      Kernel objects are statically allocated or explicitly freed; there is no
+      refcount integer that could overflow and trigger UAF. The CWE-190/416
+      attack surface does not apply in this form.
+  C1b.4:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files:
+      - "sources/zephyr/include/zephyr/sys/dlist.h"
+      - "sources/zephyr/include/zephyr/sys/slist.h"
+      default_state: >-
+        No hardening. List nodes are plain prev/next pointers with no
+        validation.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the attack surface exists (kernel uses doubly-linked lists for
+      thread queues, wait queues, etc.) but there is no list integrity
+      hardening — no poison values on removal, no double-remove detection,
+      no consistency checks on append/remove.
+  C1b.5:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — MTE temporal mode is an ARMv9-A feature not present on Cortex-M33.
+  C1c.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options:
+      - "CONFIG_INIT_STACKS — default n; hardenconfig=n (kernel/Kconfig:366; debug/profiling purpose)"
+      source_files:
+      - "sources/zephyr/kernel/Kconfig:366-372 (INIT_STACKS help: 'high water mark can be easily determined')"
+      default_state: >-
+        No automatic variable initialization. INIT_STACKS is a debug feature,
+        not a security mechanism.
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the attack surface (uninitialized local variables leaking sensitive
+      values) exists. Zephyr does not enable compiler-wide auto-var-init.
+      CONFIG_INIT_STACKS serves a profiling purpose (high-water mark) and
+      hardenconfig explicitly recommends turning it off — it is not a security
+      control.
+  C1c.2:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options: []
+      source_files:
+      - "sources/zephyr/kernel/kheap.c (k_calloc uses sys_heap_aligned_alloc + memset)"
+      default_state: >-
+        k_calloc() is available but not the default; applications and kernel
+        code must explicitly use k_calloc() instead of k_malloc() to get zeroed
+        memory.
+    commits:
+    - hash: "7f95e833612"
+      date: "2017"
+      description: "mempool: add k_calloc()"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/4850"
+    rationale: |
+      P=1: k_calloc() provides zero-on-alloc for explicit callers. D=1:
+      not default; callers must use k_calloc() instead of k_malloc(). S=2:
+      when used, k_calloc zeroes the entire allocation reliably. A=2: in-tree
+      standard kernel API. T=3: k_calloc has been in Zephyr since its early
+      days; T_age=3, T_maintained=3.
+  C1d.1:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_STACK_POINTER_RANDOM — int, default 0; hardenconfig=100 (kernel/Kconfig:859)"
+      source_files:
+      - "sources/zephyr/kernel/Kconfig:859-878 (STACK_POINTER_RANDOM: 'offsets some random value to a thread initial stack pointer')"
+      - "sources/zephyr/kernel/thread.c (arch_new_thread and stack init path)"
+      default_state: >-
+        Disabled by default (STACK_POINTER_RANDOM=0). hardenconfig recommends
+        100 bytes of randomization.
+    commits:
+    - hash: "83752c1cfe0"
+      date: "2018"
+      description: "kernel: introduce initial stack randomization"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/6428"
+    rationale: |
+      P=1: CONFIG_STACK_POINTER_RANDOM provides a limited form of thread
+      stack randomization. D=1: opt-in (default=0); hardenconfig recommends
+      100 bytes. S=1: weak — the randomization is bounded by the configured
+      value (hardenconfig=100 bytes), which provides only ~6-7 bits of entropy;
+      it hinders simple stack spraying but does not prevent targeted exploitation
+      with brute force or information leak. The firmware image remains at a
+      fixed XIP address. A=2: in-tree Kconfig option. T=3: T_age=3, T_maintained=3.
+  C1d.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — sys_heap uses deterministic first-fit coalescing; no heap layout
+      randomization. XIP design means the heap resides at a fixed address
+      in SRAM.
+  C1d.3:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the struct-layout-predictability surface exists for Zephyr's C
+      kernel structs (k_thread, k_queue, driver ops tables) and no
+      randstruct-equivalent is shipped or enabled; tock and freertos record
+      P=0 for the same un-enabled-toolchain-feature situation. D=S=A=T=0 follow from P=0.
+  C1e.1:
+    P: 1
+    D: 2
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_EXECUTE_XOR_WRITE — default y inside CONFIG_USERSPACE block; depends on ARCH_HAS_EXECUTABLE_PAGE_BIT (kernel/userspace/Kconfig:17)"
+      - "CONFIG_USERSPACE — gating condition (arch/Kconfig:340)"
+      source_files:
+      - "sources/zephyr/kernel/userspace/Kconfig:17-28 (EXECUTE_XOR_WRITE: 'enforce that a writable page isn't executable and vice versa')"
+      - "sources/zephyr/arch/arm/core/mpu/ (MPU region attribute programming: XN bit enforcement)"
+      default_state: >-
+        Enabled by default when CONFIG_USERSPACE=y. Disabled (not applicable)
+        without USERSPACE. hardenconfig lists EXECUTE_XOR_WRITE=y.
+    commits:
+    - hash: "b007b64d30b"
+      date: "2017"
+      description: "kernel: Add option to ensure writable pages are not executable"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/4388"
+    rationale: |
+      P=1: CONFIG_EXECUTE_XOR_WRITE enforces W^X via MPU attributes.
+      D=2: enabled by default when USERSPACE=y (which is the primary evaluation
+      posture); the combination is the recommended production configuration.
+      S=2: hardware MPU XN enforcement prevents execution from writable
+      memory regions, raising the bar for shellcode injection;
+      however, the MPU can be reconfigured from privileged code, so S=3 is
+      not warranted. A=2: in-tree, integral to USERSPACE feature.
+      T=3: T_age=3, T_maintained=3.
+  C1e.2:
+    P: 1
+    D: 2
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_XIP — Execute-In-Place from flash (default y for flash-based targets)"
+      source_files:
+      - "sources/zephyr/include/zephyr/arch/arm/cortex_m/scripts/linker.ld (linker script placing .text/.rodata in FLASH via GROUP_ROM_LINK_IN)"
+      default_state: >-
+        Inherent to XIP hardware: flash memory is not byte-writable at runtime
+        without explicit driver calls. This is always active for flash-based
+        Cortex-M33 targets.
+    commits:
+    - hash: "8ddf82cf70d"
+      date: "2015"
+      description: "First commit"
+    discussions: []
+    rationale: |
+      P=1: compile-time const (.text/.rodata) is in read-only flash by the
+      nature of XIP. D=2: const placement in read-only flash is automatic on
+      the default flash-based build (matching the FreeRTOS calibration for the
+      same Cortex-M33 property); CONFIG_XIP is configurable, so not strictly
+      mandatory. S=1: this only protects compile-time const — there is no
+      __ro_after_init mechanism, so the runtime-initialized-then-frozen data
+      that C1e.2 targets stays writable in SRAM; the flash-RO property, while
+      hardware-backed, addresses a narrower surface than the mechanism intends.
+      A=2: in-tree linker/XIP placement, not a deep architectural ro-after-init
+      facility. Scored to match the FreeRTOS sibling evaluation, which describes
+      the identical hardware reality. T=3: XIP has been Zephyr's primary
+      execution model and is actively maintained since the project's inception;
+      T_age=3, T_maintained=3.
+  C1e.3:
+    P: 1
+    D: 2
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE — required for MPU-enforced kernel RO protection"
+      - "CONFIG_EXECUTE_XOR_WRITE — enforces RO for executable regions"
+      source_files:
+      - "sources/zephyr/arch/arm/core/mpu/arm_mpu.c (MPU region setup: FLASH region RX, SRAM regions RW+XN)"
+      - "sources/zephyr/arch/arm/core/mpu/arm_mpu_regions.c (default MPU region definitions)"
+      default_state: >-
+        Active by default when CONFIG_USERSPACE=y. Kernel code/const are in RO
+        flash (XIP) and additionally MPU-protected from user-mode write access.
+    commits:
+    - hash: "b007b64d30b"
+      date: "2017"
+      description: "kernel: Add option to ensure writable pages are not executable"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/4388"
+    rationale: |
+      P=1: kernel code and const sections are protected by both XIP read-only
+      flash and MPU-enforced privilege separation. D=2: automatically active
+      when USERSPACE=y (default for the evaluation posture). S=2: MPU
+      enforcement is hardware-backed, but privileged code can reconfigure
+      regions; there is no kernel lockdown mode preventing privileged access
+      to sensitive regions. A=2: in-tree. T=3.
+  C1e.4:
+    P: 1
+    D: 2
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE (arch/Kconfig:340)"
+      - "CONFIG_EXECUTE_XOR_WRITE (kernel/userspace/Kconfig:17)"
+      source_files:
+      - "sources/zephyr/arch/arm/core/mpu/arm_mpu.c (thread stack/data regions marked XN)"
+      - "sources/zephyr/arch/arm/core/userspace.S (z_arm_do_syscall: SVC entry as the sole kernel gate)"
+      default_state: >-
+        Active by default when CONFIG_USERSPACE=y + CONFIG_EXECUTE_XOR_WRITE=y.
+    commits:
+    - hash: "945af95f421"
+      date: "2017"
+      description: "kernel: introduce object validation mechanism"
+    - hash: "b007b64d30b"
+      date: "2017"
+      description: "kernel: Add option to ensure writable pages are not executable"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/1276"
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/4388"
+    rationale: |
+      P=1: MPU XN on user-mode RAM regions prevents user code from executing
+      arbitrary instructions in data memory, and the SVC mechanism ensures
+      user threads enter the kernel only at the defined entry point.
+      D=2: active by default when USERSPACE=y. S=2: hardware-enforced
+      via MPU; no simple ret2usr as the call gate is the SVC instruction.
+      However, the security relies on CONFIG_EXECUTE_XOR_WRITE being
+      maintained across all user partitions. A=2. T=3.
+  C1e.5:
+    P: 1
+    D: 2
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE (arch/Kconfig:340)"
+      source_files:
+      - "sources/zephyr/include/zephyr/sys/internal/kobject_internal.h:61-66 (struct k_object in privileged memory)"
+      - "sources/zephyr/arch/arm/core/mpu/arm_mpu_regions.c (background region setup)"
+      default_state: >-
+        Active by default when CONFIG_USERSPACE=y. Kernel control structures are
+        in privileged memory unavailable to user threads.
+    commits:
+    - hash: "945af95f421"
+      date: "2017"
+      description: "kernel: introduce object validation mechanism"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/1276"
+    rationale: |
+      P=1: kernel TCBs and scheduler metadata are in privileged memory
+      unmapped from user threads via MPU background region. D=2: active when
+      USERSPACE=y. S=2: MPU-enforced isolation of control metadata; user
+      threads cannot directly corrupt scheduler state. A=2. T=3.
+  C1e.6:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Cortex-M33 PMSAv8 MPU does not support execute-only permissions
+      (R=0, X=1). Read permission is implied by execute permission in the
+      PMSAv8 access permission model. Execute-only memory requires ARMv8.1-M
+      Mainline (Cortex-M85) or ARMv8-A with stage-2 translation.
+  C1e.7:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — no mseal(2) / mimmutable(2) equivalent. MPU regions are
+      reconfigurable from privileged code at any time; there is no
+      sealing or immutability API.
+  C1e.8:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: executable alignment padding exists in the firmware image and no
+      trap-fill mitigation is applied to it (tock's C1e.8 P=0 records the
+      same rule): Thumb-2's lack of a clean INT3/UD2 trap-fill idiom is
+      part of why the mitigation is absent, not a reason the padding surface
+      vanishes. D=S=A=T=0 follow from P=0.
+  C1f.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: no memory-safe language is used in the kernel itself — the
+      experimental Rust application API does not put Rust inside the kernel.
+      The mechanism (adopting a memory-safe language for kernel code) is
+      applicable to any C kernel, and the peer evaluations record the same
+      situation as P=0 (fuchsia's C++ Zircon, netbsd, hurd, freertos). N/A
+      would imply the memory-unsafety surface does not exist, which is the
+      opposite of the truth for a C code base. D=S=A=T=0 follow from P=0.
+  C2a.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: "No software CFI is enabled in the Zephyr kernel build."
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: the attack surface (indirect function calls via callback tables,
+      device driver ops structs) exists in Zephyr. No software CFI instrumentation
+      is applied to the kernel build.
+  C2a.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Intel IBT is x86-specific hardware. Primary evaluation target
+      is Cortex-M33 (ARM). Zephyr's x86 port does not expose a CONFIG_X86_IBT
+      equivalent.
+  C2a.3:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 2
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "ARM_PACBTI_BTI — selects ARM_BTI; default NONE; depends on ARMV8_1_M_MAINLINE || ARMV8_A || ARMV9_A (arch/common/Kconfig:162)"
+      - "ARM_PACBTI_STANDARD — selects ARM_PAC + ARM_BTI (arch/common/Kconfig:139)"
+      - "ARM_PACBTI_PACRET_BTI / PACRET_LEAF_BTI — mixed options (arch/common/Kconfig:170,179)"
+      source_files:
+      - "sources/zephyr/arch/common/Kconfig:114-194 (ARM_BTI, ARM_PACBTI choice)"
+      default_state: >-
+        ARM_PACBTI_NONE by default. BTI requires ARMV8_1_M_MAINLINE (Cortex-M85)
+        or ARM64/ARMv9-A silicon, which the primary Cortex-M33 evaluation target
+        lacks. Available for Cortex-M85 and A-profile comparators.
+    commits:
+    - hash: "8e5f828fefc"
+      date: "2025"
+      description: "arch: arm: enable PACBTI support"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/95125"
+    rationale: |
+      P=1: CONFIG_ARM_BTI and the ARM_PACBTI choice exist in Zephyr's ARM
+      architecture support, ready for eligible silicon. D=1: opt-in; default
+      is ARM_PACBTI_NONE. S=2: BTI landing pads require FEAT_PACBTI silicon
+      and restrict valid indirect branch targets to marked instructions,
+      meaningfully reducing ROP/JOP gadget availability. A=2: in-tree upstream
+      support. T=2: ARM PACBTI support was added in the v3.x era (~2022-2023);
+      T_age=2, T_maintained=3.
+  C2b.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: "No software backward-edge protection."
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: return address spoofing via ROP is a valid attack surface;
+      no software shadow call stack or return-address signing (without
+      hardware PAC) is applied in the Cortex-M kernel build.
+  C2b.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A on Cortex-M primary target. CONFIG_HW_SHADOW_STACK exists in
+      Zephyr but only for x86 (arch/x86/Kconfig:115 sets
+      ARCH_HAS_HW_SHADOW_STACK). Intel CET shadow stack does not apply to
+      Cortex-M33.
+  C2b.3:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 2
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "ARM_PACBTI_PACRET — selects ARM_PAC for return address signing (arch/common/Kconfig:147)"
+      - "CONFIG_ARM_PAC_PER_THREAD — per-thread PAC keys via csrand; depends on ARM_PAC (arch/common/Kconfig:92)"
+      source_files:
+      - "sources/zephyr/arch/common/Kconfig:92-194 (ARM_PAC, ARM_PAC_PER_THREAD, ARM_PACBTI choice)"
+      - "sources/zephyr/arch/arm/core/cortex_m/thread.c:607 (__set_PAC_KEY_P for per-thread PAC key setup)"
+      default_state: >-
+        ARM_PACBTI_NONE by default. PAC requires FEAT_PACBTI silicon not present
+        in Cortex-M33. Available for Cortex-M85 (ARMV8_1_M_MAINLINE) and all
+        ARM64/ARMv9-A targets.
+    commits:
+    - hash: "8e5f828fefc"
+      date: "2025"
+      description: "arch: arm: enable PACBTI support"
+    - hash: "09cc777daaf"
+      date: "2025"
+      description: "arch: arm: add per thread unique PAC key support"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/95125"
+    rationale: |
+      P=1: ARM_PACBTI/ARM_PAC support is fully implemented in Zephyr,
+      including per-thread key management. D=1: default NONE; requires
+      explicit ARM_PACBTI selection and FEAT_PACBTI hardware. S=2: PAC
+      provides strong return-address signing; per-thread keys with
+      cryptographic randomization (ARM_PAC_PER_THREAD) prevent cross-thread
+      canary reuse. A=2: in-tree upstream. T=2: T_age=2, T_maintained=3.
+  C2b.4:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the Guarded Control Stack (FEAT_GCS) is an ARMv9.4-A feature.
+      No Cortex-M silicon (M33, M85) implements it, and Zephyr has no GCS
+      support in its ARM architecture code (unlike ARM_PAC/ARM_BTI in
+      arch/common/Kconfig, there is no CONFIG_*GCS* symbol). The primary
+      evaluation target is ARMv8-M Cortex-M33, which has no GCS hardware,
+      so the attack-surface/hardware for this mechanism does not exist on
+      the platform. Same N/A basis as C1a.6/C1b.5 (MTE): ARM64 GCS is N/A
+      for all targets lacking FEAT_GCS silicon. (Cortex-M backward-edge protection, where
+      silicon permits, is ARM PAC return-signing — scored under C2b.3 — not
+      GCS.)
+  C2c.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Zephyr has no in-kernel JIT engine. No eBPF or equivalent VM.
+      JIT spray is not a relevant attack surface.
+  C3a.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Zephyr uses XIP execution from flash at a fixed link address.
+      No base-address relocation or KASLR. CONFIG_STACK_POINTER_RANDOM
+      provides thread-stack randomization but not image-base randomization.
+  C3a.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — no function-level randomization; single statically linked XIP image.
+  C3b.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Cortex-M33 is an in-order microprocessor with no speculative
+      page-table walk. Meltdown (CVE-2017-5754) requires out-of-order
+      speculative execution past a faulting load; this does not apply.
+      No KPTI is needed or implemented.
+  C3b.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A on Cortex-M (no hardware SMAP/PAN). The MPU-based user-pointer
+      validation via arch_buffer_validate() (C1a.3) provides an analogous
+      software-enforced boundary, but SMAP/PAN as hardware is unavailable.
+  C3c.1:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files:
+      - "sources/zephyr/lib/heap/heap.c:69-76 (poison_chunk_canary sets canary to 0xDEADBEEF on free, not data zeroing)"
+      default_state: "No zeroing on free."
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: freed heap memory retains its contents, creating a potential
+      information leak if the freed chunk is reallocated to a less-trusted
+      context. No zeroing-on-free mechanism is available.
+  C3c.2:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: "No stack erasure on syscall return."
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: kernel stack contents are not erased before returning to user
+      mode, allowing a subsequent syscall (e.g., via a time of check/time
+      of use race or via kernel stack reuse) to potentially leak kernel
+      stack data.
+  C3c.3:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: "No register scrubbing."
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: sensitive values in registers are not cleared before return;
+      no register-scrubbing mechanism is implemented.
+  C3d.1:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_PRINTK — default y; hardenconfig=n (subsys/debug/Kconfig:145)"
+      - "CONFIG_LOG — complex logging subsystem; hardenconfig=n"
+      - "CONFIG_BOOT_BANNER — startup banner; hardenconfig=n"
+      - "CONFIG_FAULT_DUMP — fault dump verbosity; hardenconfig=0"
+      source_files:
+      - "sources/zephyr/subsys/debug/Kconfig:145-150 (PRINTK: default y)"
+      - "sources/zephyr/scripts/kconfig/hardened.csv:1,21 (BOOT_BANNER=n, FAULT_DUMP=0, PRINTK=n)"
+      default_state: >-
+        PRINTK=y, BOOT_BANNER=y by default. Logging is enabled by default and
+        must be explicitly disabled for a production hardened build.
+    commits:
+    - hash: "e0b2fb75db2"
+      date: "2019"
+      description: "hardening: Introducing hardenconfig tool"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/20326"
+    rationale: |
+      P=1: the mechanism (restricting kernel log output) is available via
+      Kconfig. D=1: logging is on by default; restriction requires explicit
+      configuration (hardenconfig provides the recommended settings). S=1:
+      the protection is all-or-nothing (disable vs enable) with no selective
+      address hashing or fine-grained restriction. A=2: Kconfig-based.
+      T=3: T_age=3, T_maintained=3.
+  C3d.2:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_SHELL — hardenconfig=n (subsys/shell/Kconfig)"
+      - "CONFIG_DEBUG_THREAD_INFO — hardenconfig=n"
+      - "CONFIG_THREAD_MONITOR — hardenconfig=n"
+      - "CONFIG_THREAD_NAME — hardenconfig=n"
+      - "CONFIG_THREAD_ANALYZER — hardenconfig=n"
+      source_files:
+      - "sources/zephyr/scripts/kconfig/hardened.csv:35,45,48,58,60 (SHELL=n, THREAD_MONITOR=n, THREAD_NAME=n, DEBUG_THREAD_INFO=n, THREAD_ANALYZER=n)"
+      default_state: >-
+        CONFIG_SHELL is typically off by default but may be enabled in board
+        defconfigs or application Kconfigs. hardenconfig explicitly disables all
+        diagnostic interfaces.
+    commits:
+    - hash: "e0b2fb75db2"
+      date: "2019"
+      description: "hardening: Introducing hardenconfig tool"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/20326"
+    rationale: |
+      P=1: diagnostic interfaces exist and can be restricted. D=1: requires
+      explicit hardenconfig-style disablement; not all interfaces are off by
+      default. S=1: coarse-grained (enable/disable); no fine-grained access
+      control on the shell. A=2. T=3.
+  C4.2:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE (arch/Kconfig:340)"
+      - "CONFIG_MAX_THREAD_BYTES — size of permission bitmap (default 1 byte = 8 threads)"
+      source_files:
+      - "sources/zephyr/include/zephyr/sys/internal/kobject_internal.h:61-66 (struct k_object: perms bitmap)"
+      - "sources/zephyr/kernel/userspace/userspace.c:811-889 (z_impl_k_object_access_grant:811, k_object_access_revoke:820, k_object_validate:854)"
+      - "sources/zephyr/include/zephyr/internal/syscall_handler.h (K_OBJ_TYPE validation macros)"
+      default_state: >-
+        Only active with CONFIG_USERSPACE=y. By default, user-mode threads have
+        no kernel object permissions; they must be explicitly granted by a
+        privileged thread.
+    commits:
+    - hash: "945af95f421"
+      date: "2017"
+      description: "kernel: introduce object validation mechanism"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/1276"
+    rationale: |
+      P=1: comprehensive per-object, per-thread capability/permission system.
+      D=1: requires CONFIG_USERSPACE=y (opt-in). S=2: per-object permissions
+      are enforced on every syscall via k_object_validate(), covering all
+      kernel object types; default deny for user threads. A=2: in-tree,
+      integral to USERSPACE. T=3: T_age=3, T_maintained=3.
+  C4.3:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE — enables SVC syscall framework (arch/Kconfig:340)"
+      - "CONFIG_BOUNDS_CHECK_BYPASS_MITIGATION — hardenconfig=y; adds index masking in user-facing syscall handlers (kernel/userspace/Kconfig:29)"
+      source_files:
+      - "sources/zephyr/kernel/userspace/userspace.c (syscall dispatch and validation)"
+      - "sources/zephyr/kernel/userspace/userspace_handler.c (generated syscall handlers)"
+      - "sources/zephyr/include/zephyr/internal/syscall_handler.h (syscall validation macros)"
+      - "sources/zephyr/kernel/userspace/Kconfig:29-38 (BOUNDS_CHECK_BYPASS_MITIGATION)"
+      default_state: >-
+        Only active with CONFIG_USERSPACE=y. BOUNDS_CHECK_BYPASS_MITIGATION is
+        off by default but hardenconfig=y.
+    commits:
+    - hash: "945af95f421"
+      date: "2017"
+      description: "kernel: introduce object validation mechanism"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/1276"
+    rationale: |
+      P=1: Zephyr implements a strongly typed, permission-validated syscall
+      framework. D=1: requires CONFIG_USERSPACE. S=2: each syscall entry
+      point validates argument types, sizes, kobject permissions, and user
+      pointer bounds before executing; the attack surface is limited to
+      the explicitly defined syscall set. BOUNDS_CHECK_BYPASS_MITIGATION
+      adds index masking. A=2: in-tree, integral. T=3.
+  C4.5:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Zephyr firmware is a statically linked image. There is no
+      mechanism to dynamically load kernel extensions or modules at runtime.
+  C4.6:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE (arch/Kconfig:340)"
+      - "CONFIG_MAX_DOMAIN_PARTITIONS — maximum MPU partitions per domain"
+      source_files:
+      - "sources/zephyr/kernel/userspace/mem_domain.c (k_mem_domain_init, k_mem_domain_add_partition, k_mem_domain_add_thread)"
+      - "sources/zephyr/kernel/userspace/Kconfig.mem_domain"
+      - "sources/zephyr/include/zephyr/kernel.h (k_mem_domain/k_mem_partition API)"
+      default_state: >-
+        Active when CONFIG_USERSPACE=y. Applications must explicitly define
+        domains and assign threads.
+    commits:
+    - hash: "e9c9702818a"
+      date: "2017"
+      description: "kernel: add memory domain APIs"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/814"
+    rationale: |
+      P=1: memory domains provide MPU-enforced address-space isolation per
+      thread group, serving as process-level isolation in the RTOS context.
+      D=1: requires CONFIG_USERSPACE + explicit domain setup by the application.
+      S=2: hardware MPU enforcement; thread isolation is as strong as the
+      MPU region model allows (8-16 regions on Cortex-M33). A=2: in-tree.
+      T=3: T_age=3, T_maintained=3.
+  C4.7:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Zephyr has no UID/credential model, no ptrace, and no process
+      relationship hierarchy. Threads have priority levels and kobject
+      permissions only.
+  C4.8:
+    P: 0
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state: "No syscall origin pinning implemented."
+    commits: []
+    discussions: []
+    rationale: |
+      P=0: no explicit syscall origin pinning. The implicit constraint that
+      user threads can only execute from read-only flash (XIP + W^X) limits
+      the origin to legitimate code sections, but the kernel performs no
+      origin check on the SVC instruction's PC. ROP chains in flash could
+      still issue SVC from within gadgets.
+  C5a.1:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE — prerequisite for user-mode driver threads"
+      source_files:
+      - "sources/zephyr/include/zephyr/device.h (device API; drivers typically run in kernel context)"
+      default_state: >-
+        Drivers run privileged. User-mode driver threads are possible but must
+        be explicitly designed.
+    commits:
+    - hash: "945af95f421"
+      date: "2017"
+      description: "kernel: introduce object validation mechanism"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/1276"
+    rationale: |
+      P=1: user-mode driver isolation is architecturally possible with
+      CONFIG_USERSPACE (drivers as restricted user threads). D=1: requires
+      explicit design; default is privileged kernel-context drivers.
+      S=1: when implemented, driver isolation is MPU-enforced; however
+      most Zephyr drivers run privileged with no fault containment, so
+      the practical protection is weak. A=2: in-tree. T=3.
+  C5a.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — no loadable kernel modules in Zephyr; statically linked firmware.
+  C5a.3:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — no in-kernel JIT or verifier VM. Zephyr has no eBPF equivalent.
+  C5b.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Zephyr may run as a hypervisor guest (CONFIG_ACRN_GUEST) but
+      has no in-kernel hypervisor-enforced integrity (HEKI) mechanism.
+  C5b.2:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 2
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_ARM_TRUSTZONE_M — enables TrustZone-M support (arch/arm/core/cortex_m/tz/Kconfig:6)"
+      - "CONFIG_BUILD_WITH_TFM — integrates TF-M 2.1.0 as the Secure world companion (boards with TrustZone-M)"
+      - "CONFIG_TFM_PSA_CRYPTO — PSA Crypto API backed by TF-M"
+      source_files:
+      - "sources/zephyr/arch/arm/core/cortex_m/tz/Kconfig:6 (ARM_TRUSTZONE_M)"
+      - "sources/zephyr/modules/trusted-firmware-m/ (TF-M integration glue)"
+      - "sources/zephyr/boards/arm/mps3/Kconfig.defconfig:30 (BUILD_WITH_TFM on MPS3)"
+      default_state: >-
+        Requires explicit BUILD_WITH_TFM and compatible Cortex-M33/M23 hardware.
+        Several production boards (Nordic nRF54L15, Arm MPS3, Ezurio BL54L15)
+        enable it by default in their Kconfig.defconfig.
+    commits:
+    - hash: "80a9fc3fa18"
+      date: "2019"
+      description: "arm: v2m musca: Add support for v2m musca SoC and board"
+    - hash: "f2ccd2b00aa"
+      date: "2020"
+      description: "boards: arm: mps2_an521: Add TFM support"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/9453"
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/19985"
+    rationale: |
+      P=1: TrustZone-M + TF-M provides architectural isolation of sensitive
+      key material and attestation in the Secure world, inaccessible from
+      Non-Secure (Zephyr) world. D=1: requires explicit BUILD_WITH_TFM and
+      compatible hardware; not universally available. S=2: TrustZone
+      hardware boundary prevents Non-Secure code from reading Secure memory;
+      PSA Crypto provides key isolation. A=2: in-tree via modules/trusted-firmware-m/.
+      T=2: TF-M integration in Zephyr began ~2020-2021; T_age=2, T_maintained=3.
+  C5c.1:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_ARM_TRUSTZONE_M (arch/arm/core/cortex_m/tz/Kconfig:6) — enables TrustZone-M; set in nrf9160dk/nrf9160/ns defconfig"
+      - "CONFIG_TRUSTED_EXECUTION_NONSECURE (arch/Kconfig:314) — Zephyr built as the non-secure image behind the SPU/GTZC partition"
+      - "CONFIG_BUILD_WITH_TFM (modules/trusted-firmware-m/Kconfig.tfm:46) — builds TF-M as the secure image that programs SPU/GTZC/SAU at boot"
+      - "CONFIG_NRF_SPU_FLASH_REGION_SIZE / CONFIG_NRF_SPU_RAM_REGION_SIZE (soc/nordic/nrf91/Kconfig:24,30) — SPU partition granularity for the nRF9160 secure/non-secure split"
+      source_files:
+      - "sources/zephyr/dts/arm/nordic/nrf91.dtsi:109-114 (SPU peripheral node, compatible nordic,nrf-spu, for the nRF9160 target)"
+      - "sources/zephyr/dts/bindings/arm/nordic,nrf-spu.yaml (SPU System Protection Unit DT binding)"
+      - "sources/zephyr/soc/nordic/nrf92/soc.c:103-111 (in-tree DMASEC programming: nrf_spu_periph_perm_dmasec_set confines the CCM crypto peripheral's DMA master to secure memory)"
+      - "sources/zephyr/soc/nordic/nrf71/soc.c:69-119 (in-tree MPC region overrides binding which RAM/MRAM regions DMA masters per domain may reach)"
+      - "sources/zephyr/soc/nordic/nrf53/nrf53_cpunet_mgmt.c:108 (nrf_spu_extdomain_set assigns the network-core external bus master to the non-secure domain)"
+      - "sources/zephyr/soc/nordic/common/soc_secure.c (non-secure-side veneers: Zephyr behind the SPU reaches secure-only FICR/GPIO only via TF-M platform services)"
+      - "sources/zephyr/boards/nordic/nrf9160dk/doc/index.rst:91,106-135 (doc: SPU defines secure/non-secure regions; secure image built with TF-M by default)"
+      default_state: >-
+        For the primary Cortex-M33 nRF9160 target the documented build target is
+        the non-secure board variant (nrf9160dk/nrf9160/ns), whose defconfig
+        sets CONFIG_ARM_TRUSTZONE_M=y and CONFIG_TRUSTED_EXECUTION_NONSECURE=y.
+        In that posture the SPU peripheral/RAM/flash partition and DMA-master
+        DMASEC attribution are active, programmed by the secure image (TF-M
+        built by default for nRF9160). A developer may instead build a single
+        secure-only image (no TrustZone split), in which case the SPU is not
+        necessarily programmed and DMA-capable peripherals are unconfined — the
+        isolation is tied to choosing the _ns/TrustZone build, hence opt-in.
+        STM32L5/U5 _ns boards behave analogously with GTZC programmed by TF-M.
+    commits:
+    - hash: "bd4d1e7ba9cb"
+      date: "2019-01-25"
+      description: "dts: nordic: add binding and macro mapping for SPU (System Protection Unit peripheral, basis of the nRF secure/non-secure + DMASEC partition)"
+    - hash: "207f2ab1e67a"
+      date: "2021-06-04"
+      description: "modules: tf-m: split TF-M configuration in multiple Kconfig files (TF-M integration that programs SPU/GTZC/SAU as Zephyr's secure side)"
+    - hash: "242a70b32e4e"
+      date: "2024-08-02"
+      description: "soc: nordic: Add initial support for nRF9280 SiP (introduces in-tree nrf_spu_periph_perm_dmasec_set DMA-master security attribution)"
+    discussions: []
+    rationale: |
+      The C5c.1 DMA-bypass surface is real (Cortex-M has no IOMMU; a DMA-capable
+      peripheral is a bus master the CPU MPU cannot constrain), so the
+      question is what Zephyr ships in-tree to bound it — not whether an
+      IOMMU exists. Unlike freertos/tock (which delegate all peripheral
+      firewalling to out-of-tree vendor code), Zephyr ships the primitive
+      in-tree: the SPU DT binding/node, TF-M integration that programs the
+      SPU/GTZC/SAU partition as Zephyr's secure side, and direct DMASEC/MPC
+      DMA-master attribution code on newer Nordic SoCs. P=1: a
+      peripheral/DMA isolation mechanism is shipped. D=1: active only when
+      the TrustZone/_ns build is selected (the documented posture for
+      nRF9160/STM32L5); a non-TrustZone secure-only build leaves peripherals
+      unconfined — opt-in, mirroring the sibling C5b.2 D=1. S=2: the
+      SPU/GTZC firewall is a hardware boundary with no trivial bypass and
+      bounds DMA masters to their security domain, but partitions only
+      secure-vs-non-secure — it does not isolate masters from each other
+      within a domain, so a compromised non-secure DMA master can still
+      reach all non-secure RAM (not the S=3 of a true per-device IOMMU like
+      fuchsia's). A=2: in-tree option (DT binding + SoC code + TF-M module
+      glue), not an always-on core design. T_age=3: the SPU binding dates to
+      2019-01 and TF-M integration to 2021 (>5 yr). T_maintained=3: actively
+      maintained (TF-M Kconfig and nrf71/nrf92 SPU code commits within the
+      last 18 months). T=min(3,3)=3.
+  C5c.2:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE (arch/Kconfig:340)"
+      - "CONFIG_MAX_DOMAIN_PARTITIONS — limits available MPU partition slots"
+      - "CONFIG_EXECUTE_XOR_WRITE — W^X enforcement on partitions (kernel/userspace/Kconfig:17)"
+      source_files:
+      - "sources/zephyr/kernel/userspace/mem_domain.c (k_mem_domain_init, add_partition, add_thread)"
+      - "sources/zephyr/arch/arm/core/mpu/arm_mpu.c (MPU region programming on context switch)"
+      default_state: >-
+        Active when CONFIG_USERSPACE=y. Each thread switch reprograms the MPU.
+    commits:
+    - hash: "e9c9702818a"
+      date: "2017"
+      description: "kernel: add memory domain APIs"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/814"
+    rationale: |
+      P=1: memory domains provide hardware-enforced address-space compartments.
+      D=1: requires CONFIG_USERSPACE and explicit domain setup. S=2:
+      MPU-enforced with hardware boundary; kernel data/code unavailable to
+      user threads by default. A=2: in-tree. T=3.
+  C5c.3:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A on Cortex-M (no MTE).
+  C5d.1:
+    P: 1
+    D: 1
+    S: 1
+    A: 2
+    T_age: 2
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_BUILD_WITH_TFM — enables TF-M secure world service separation"
+      source_files:
+      - "sources/zephyr/modules/trusted-firmware-m/ (TF-M integration)"
+      default_state: >-
+        Monolithic by default. TF-M service separation requires BUILD_WITH_TFM
+        and compatible hardware.
+    commits:
+    - hash: "f2ccd2b00aa"
+      date: "2020"
+      description: "boards: arm: mps2_an521: Add TFM support"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/19985"
+    rationale: |
+      P=1: TF-M provides architectural separation for a subset of security
+      services (crypto, attestation, storage). D=1: requires explicit
+      BUILD_WITH_TFM; default is fully monolithic. S=1: limited in scope —
+      only security-sensitive services move to TF-M; general kernel services
+      (drivers, network stack, filesystem) remain monolithic. A=2: in-tree
+      module. T=2: T_age=2, T_maintained=3.
+  C5d.2:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE (arch/Kconfig:340)"
+      source_files:
+      - "sources/zephyr/arch/arm/core/mpu/arm_mpu.c (per-thread MPU reprogramming on context switch)"
+      - "sources/zephyr/kernel/userspace/mem_domain.c (domain partition enforcement)"
+      default_state: "Active when CONFIG_USERSPACE=y."
+    commits:
+    - hash: "e9c9702818a"
+      date: "2017"
+      description: "kernel: add memory domain APIs"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/814"
+    rationale: |
+      P=1: user threads are confined to their MPU memory domains, limiting
+      lateral movement between isolated subsystems. D=1: requires USERSPACE.
+      S=2: hardware MPU enforcement on every context switch; kernel data
+      unavailable to user threads. A=2: in-tree. T=3.
+  C6.1:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_BOOTLOADER_MCUBOOT — enables MCUboot signature verification at boot (modules/Kconfig.mcuboot:13)"
+      - "CONFIG_MCUBOOT_SIGNATURE_KEY_FILE — path to the signing key"
+      source_files:
+      - "sources/zephyr/modules/Kconfig.mcuboot:13 (BOOTLOADER_MCUBOOT)"
+      - "sources/zephyr/scripts/west_commands/sign.py (west sign integration)"
+      - "sources/zephyr/cmake/mcuboot.cmake (MCUboot image signing integration)"
+      default_state: >-
+        Opt-in. MCUboot must be configured as a separate bootloader image and
+        BOOTLOADER_MCUBOOT=y added to the application config. Several production
+        platforms (Nordic nRF52840dk, nRF5340dk) enable it by default in their
+        defconfig.
+    commits:
+    - hash: "72684ef815e"
+      date: "2018"
+      description: "dts: mcuboot: Support for common overlays and mcuboot"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/6020"
+    rationale: |
+      P=1: MCUboot provides cryptographic firmware image verification at boot.
+      D=1: opt-in (many production boards enable it; requires a separate
+      MCUboot partition). S=2: Ed25519/ECDSA-P256 signature verification
+      prevents execution of unsigned firmware; anti-rollback counters prevent
+      downgrade. Known weaknesses: MCUboot's security depends on the signing
+      key being kept offline; physical extraction of flash can bypass
+      verification if RDP/secure boot is not configured in the SoC ROM.
+      A=2: in-tree as a Zephyr module. T=3: MCUboot/Zephyr integration
+      dates to 2018; T_age=3, T_maintained=3.
+  C6.2:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 2
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_BUILD_WITH_TFM — required for TF-M attestation"
+      - "CONFIG_TFM_PSA_ATTESTATION — enables TF-M IAT generation"
+      source_files:
+      - "sources/zephyr/modules/trusted-firmware-m/Kconfig.tfm (TFM_PSA_ATTESTATION)"
+      - "sources/zephyr/modules/trusted-firmware-m/interface/ (PSA attestation API)"
+      default_state: >-
+        Requires BUILD_WITH_TFM and compatible Cortex-M33/M23 hardware. Some
+        Nordic boards (nRF54L15dk) enable BUILD_WITH_TFM by default.
+    commits:
+    - hash: "f2ccd2b00aa"
+      date: "2020"
+      description: "boards: arm: mps2_an521: Add TFM support"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/19985"
+    rationale: |
+      P=1: TF-M provides PSA attestation with software component measurement.
+      D=1: requires BUILD_WITH_TFM and compatible hardware. S=2: CBOR/COSE
+      signed IAT with device-unique key stored in TrustZone Secure world
+      provides strong attestation evidence; forgery requires compromising
+      TF-M secure storage. A=2: in-tree. T=2: TF-M attestation integration
+      ~2021-2022; T_age=2, T_maintained=3.
+  C6.3:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Zephyr firmware is a statically linked image. There is no
+      loadable module mechanism; the entire code base is verified as a
+      single image by MCUboot at boot (C6.1). Per-file or per-module
+      signing (analogous to MODULE_SIG_FORCE) is not applicable.
+  C6.4:
+    P: 1
+    D: 2
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_EXECUTE_XOR_WRITE — enforces W^X for partition runtime integrity"
+      - "CONFIG_XIP — flash is physically RO at runtime"
+      source_files:
+      - "sources/zephyr/arch/arm/core/mpu/arm_mpu.c (kernel text region marked RX in MPU)"
+      default_state: >-
+        XIP-based kernel code RO is always active. EXECUTE_XOR_WRITE is default
+        y when USERSPACE=y.
+    commits:
+    - hash: "b007b64d30b"
+      date: "2017"
+      description: "kernel: Add option to ensure writable pages are not executable"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/4388"
+    rationale: |
+      P=1: kernel .text is in physically read-only flash (XIP) and MPU-marked
+      RX, providing hardware-enforced runtime code integrity. D=2: the XIP
+      property is always active for flash-based Cortex-M33 targets. S=1:
+      no runtime integrity monitoring or lockdown mode; privileged code
+      can reconfigure MPU; no equivalent to Linux Lockdown or LKRG.
+      A=2: in-tree. T=3.
+  C6.5:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_BUILD_OUTPUT_STRIPPED — hardenconfig=y; strips symbols from firmware image"
+      - "CONFIG_BOOTLOADER_MCUBOOT — provides SHA-256 boot-time image integrity"
+      source_files:
+      - "sources/zephyr/scripts/kconfig/hardened.csv:14 (BUILD_OUTPUT_STRIPPED=y)"
+      - "sources/zephyr/scripts/west_commands/sign.py (MCUboot image signing with SHA-256)"
+      default_state: >-
+        BUILD_OUTPUT_STRIPPED is opt-in but hardenconfig=y. MCUboot hash
+        verification requires BOOTLOADER_MCUBOOT=y.
+    commits:
+    - hash: "e51ce4d34d3"
+      date: "2017"
+      description: "cmake: Generate POST_BUILD items based on KConfig"
+    - hash: "72684ef815e"
+      date: "2018"
+      description: "dts: mcuboot: Support for common overlays and mcuboot"
+    discussions:
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/5112"
+    - "https://github.com/zephyrproject-rtos/zephyr/pull/6020"
+    rationale: |
+      P=1: symbol stripping (BUILD_OUTPUT_STRIPPED) and MCUboot hash
+      verification together provide object integrity protection. D=1:
+      BUILD_OUTPUT_STRIPPED requires explicit opt-in (hardenconfig=y).
+      S=2: SHA-256 integrity check at boot (via MCUboot) is cryptographically
+      strong; symbol stripping impedes static analysis of leaked binaries.
+      A=2: in-tree. T=3.
+  C7a.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Cortex-M33 is an in-order processor with no speculative
+      execution engine; Spectre v1 (bounds check bypass) requires
+      speculative execution past a conditional branch. The hardware
+      attack surface does not exist. CONFIG_BOUNDS_CHECK_BYPASS_MITIGATION
+      is a defensive practice noted in C4.3.
+  C7a.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Cortex-M33 has no indirect branch predictor. Spectre v2
+      (branch target injection) requires a shared branch predictor;
+      this attack surface does not exist on Cortex-M.
+  C7a.3:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Cortex-M33 has no speculative store bypass hardware.
+  C7a.4:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Cortex-M33 is in-order; SLS (straight-line speculation,
+      CVE-2021-26341) requires speculative execution past unconditional
+      branches, which is not possible on this microarchitecture.
+  C7b.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Cortex-M33 has no out-of-order execution. Meltdown does not
+      apply. See C3b.1 for KPTI (also N/A).
+  C7b.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Cortex-M33 has no speculative L1 cache dereference (L1TF/Foreshadow
+      requires out-of-order execution with Intel-specific L1D eviction).
+  C7c.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Cortex-M33 has no microarchitectural fill/store buffers
+      or line-fill buffers subject to MDS-class sampling attacks.
+  C7c.2:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — Cortex-M33 is a single-core processor with no SMT or
+      hyperthreading; cross-thread speculative leaks (STIBP class)
+      are not applicable.
+  C5e.1:
+    P: 1
+    D: 2
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_USERSPACE — routes user-thread faults to the constrained-abort path (arch/Kconfig:340)"
+      - "CONFIG_HW_STACK_PROTECTION — MPU stack-guard fault detection, default-on in baseline (xref C1a.2)"
+      - "CONFIG_TASK_WDT — per-thread software liveness watchdog; opt-in (subsys/task_wdt/Kconfig)"
+      - "CONFIG_TASK_WDT_HW_FALLBACK — chain task watchdog to a HW watchdog; default y when TASK_WDT (subsys/task_wdt/Kconfig)"
+      - "CONFIG_WATCHDOG — hardware watchdog driver support; opt-in (drivers/watchdog/Kconfig)"
+      source_files:
+      - "sources/zephyr/kernel/fatal.c:37-178 (k_sys_fatal_error_handler default halt; z_fatal_error per-thread abort path)"
+      - "sources/zephyr/arch/arm/core/fatal.c:113-153 (z_do_kernel_oops: user-mode fault constraint under CONFIG_USERSPACE)"
+      - "sources/zephyr/subsys/task_wdt/task_wdt.c (per-thread software watchdog channels)"
+      - "sources/zephyr/drivers/watchdog/ (hardware watchdog driver class, CONFIG_WATCHDOG)"
+      default_state: >-
+        Fault DETECTION active by default in the USERSPACE+MPU baseline (MPU
+        fault handlers + stack-overflow detection always reach z_fatal_error).
+        Default fault RESPONSE is system halt (__weak
+        k_sys_fatal_error_handler). Per-thread containment-and-continue requires
+        an app-supplied returning handler; HW + task watchdogs are opt-in.
+    commits: []
+    discussions: []
+    rationale: |
+      P=1: a real fault-handling subsystem exists (z_fatal_error path +
+      watchdogs). D=2: chosen because fault DETECTION — the first element of
+      the mechanism — is genuinely default-on in the evaluated USERSPACE+MPU
+      baseline (MPU stack guards, user-stack-overflow detection, and CPU fault
+      exceptions all unconditionally reach z_fatal_error), which matches the
+      Linux C5e.1 D=2 "detectors default-on" anchor and is strictly stronger
+      than OpenBSD C5e.1 D=1 (no detectors). D=2 is NOT credited for
+      per-thread containment: the default __weak handler HALTS and recovery
+      requires an app-supplied returning handler, so containment+recovery are
+      effectively opt-in (watchdogs likewise opt-in) — detection is the
+      default-on facet, not containment.
+      S=2: with CONFIG_USERSPACE a faulting user thread is hardware-constrained
+      (only OOPS/stack-fail propagate from nPRIV) and can be aborted without
+      taking down the kernel — genuine per-thread fault containment when a
+      returning handler is installed — but the unconfigured default is a
+      whole-system halt and kernel-mode faults are unrecoverable, so this is
+      "significantly raises difficulty, not bypass-proof," matching Linux
+      C5e.1 S=2 (oops kills task) and above OpenBSD S=1 (panic-reboot only).
+      A=2: in-tree, configurable; not a microkernel-style core design property
+      (contrast seL4/Tock where the process is the architectural fault unit).
+      T: fatal-error handling and CONFIG_USERSPACE date to 2017 (kernel/fatal.c,
+      kernel/userspace/userspace.c copyright 2017); the task watchdog landed in
+      2020 (subsys/task_wdt copyright 2020) — all >5y, so T_age=3; these paths
+      are actively maintained, T_maintained=3; effective T=min(3,3)=3. (Shallow
+      clone — git log grafted/flattened; T_age derived from feature-history file
+      copyrights + release timeline, not per-file git log.)
+  C5e.2:
+    P: 1
+    D: 2
+    S: 1
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_TIMESLICING — time-slice equal-priority preemptible threads; default y (kernel/Kconfig:551)"
+      - "CONFIG_TIMESLICE_SIZE — slice duration in ms (kernel/Kconfig:559)"
+      - "CONFIG_USERSPACE_THREAD_MAY_RAISE_PRIORITY — depends on TEST; never set in production (kernel/userspace/Kconfig:11)"
+      - "CONFIG_SCHED_DEADLINE — EDF ordering within a priority only, no admission control (kernel/Kconfig:116)"
+      source_files:
+      - "sources/zephyr/kernel/thread.c:1398-1409 (z_vrfy_k_thread_priority_set rejects user-mode priority elevation)"
+      - "sources/zephyr/kernel/Kconfig:551-557 (CONFIG_TIMESLICING default y)"
+      - "sources/zephyr/kernel/userspace/Kconfig:11-15 (USERSPACE_THREAD_MAY_RAISE_PRIORITY gated on TEST)"
+      - "sources/zephyr/kernel/sched.c (time-slice yield / scheduling)"
+      default_state: >-
+        Time-slicing among equal-priority preemptible threads is default-on
+        (CONFIG_TIMESLICING=y). User threads cannot raise priority in
+        production. No per-thread CPU-time budget/cap is available.
+    commits: []
+    discussions: []
+    rationale: |
+      P=1: a temporal-isolation surface exists — preemptive scheduler with
+      default time-slicing, plus an enforced rule that user threads cannot
+      raise priority (kernel/thread.c:1398-1409; the raise-priority option is
+      TEST-only). D=2: CONFIG_TIMESLICING is default-on (kernel/Kconfig:553) in
+      a preemptive build, and the user-mode priority-elevation guard is the
+      production default (USERSPACE_THREAD_MAY_RAISE_PRIORITY depends on TEST),
+      so the protective behaviour is active out of the box — matching the
+      D=2 anchors for Linux/OpenBSD C5e.2. S=1 (weak): there is NO per-thread
+      CPU-bandwidth/budget enforcement — a same-priority compromised thread
+      still gets equal slices indefinitely, cooperative and meta-IRQ/ISR work
+      is outside slicing, and kernel threads are not budgeted; SCHED_DEADLINE
+      only orders within a priority and has no admission control, so it does
+      not lift S. This is below Linux C5e.2 S=2 (cpu.max + RT guard + DEADLINE
+      admission) and matches the OpenBSD C5e.2 S=1 anchor (priorities/limits
+      but no bandwidth isolation). A=2: in-tree scheduler option, not a
+      capability-budget core property (contrast seL4 MCS scheduling contexts).
+      T: the priority/preemption scheduler and the userspace priority-set
+      verifier are long-standing (CONFIG_USERSPACE 2017; time-slicing predates
+      it), >5y → T_age=3; scheduler is actively maintained, T_maintained=3;
+      T=min(3,3)=3. (Shallow clone — T_age from feature history, not git log.)
+  C5e.3:
+    P: 1
+    D: 1
+    S: 2
+    A: 2
+    T_age: 3
+    T_maintained: 3
+    implementation:
+      config_options:
+      - "CONFIG_DYNAMIC_OBJECTS — runtime kobjects charged to the thread resource pool; opt-in, depends on USERSPACE (arch/Kconfig:449)"
+      - "CONFIG_HEAP_MEM_POOL_SIZE — system heap size; default 0 (kernel/Kconfig:651)"
+      - "CONFIG_MAX_THREAD_BYTES — bounds the kernel thread-permission bitmap / thread count"
+      - "CONFIG_USERSPACE — prerequisite for resource-pool-charged allocation (arch/Kconfig:340)"
+      source_files:
+      - "sources/zephyr/kernel/mempool.c:179-211 (z_thread_alloc_helper: allocate from _current->resource_pool, deny if NULL; pool-assign API)"
+      - "sources/zephyr/kernel/userspace/userspace.c:347-434 (dynamic_object_create / z_object_alloc via z_thread_aligned_alloc)"
+      - "sources/zephyr/arch/Kconfig:449-460 (CONFIG_DYNAMIC_OBJECTS — objects from the calling thread's resource pool)"
+      default_state: >-
+        Enforcement machinery is present with USERSPACE+DYNAMIC_OBJECTS, but
+        per-thread quota is only effective once the application ASSIGNS a
+        resource pool (k_thread_resource_pool_assign); a thread with no pool
+        simply cannot dynamically allocate. Static sizing (slabs/heaps/stacks
+        fixed at build) is the default exhaustion bound. No runtime hierarchical
+        quota framework.
+    commits: []
+    discussions: []
+    rationale: |
+      P=1: per-domain exhaustion bounds exist — a user thread's dynamic
+      kernel-object allocations are charged to its resource pool and denied
+      when no pool is assigned (kernel/mempool.c:187-211), plus static
+      build-time sizing of slabs/heaps/stacks. D=1: chosen deliberately —
+      although the resource-pool charging machinery is default-present once
+      CONFIG_USERSPACE+CONFIG_DYNAMIC_OBJECTS are set, the quota only takes a
+      concrete value when the application explicitly assigns a pool
+      (k_thread_resource_pool_assign), and CONFIG_DYNAMIC_OBJECTS itself is
+      opt-in (no default y, arch/Kconfig:449); a default build has no
+      configured per-thread memory quota, only static sizing — so this is
+      "available but requires opt-in," D=1. S=2: when a pool is assigned the
+      bound is hard and MPU/heap-enforced (a thread cannot allocate past its
+      k_heap, and no-pool ⇒ allocation denied), which significantly raises the
+      bar against memory-exhaustion DoS; it is not S=3 because there is no
+      hierarchical/PID/handle quota framework and the protection is per-thread
+      only (no system-wide accounting), matching the OpenBSD/Linux C5e.3 S=2
+      anchors (flat rlimits / hierarchical memcg both land at S=2). A=2:
+      in-tree option built on the userspace resource-pool model; not the
+      capability-accounted Untyped-memory core property of seL4 (A=3 there).
+      T: the resource-pool / userspace object model dates to 2017
+      (kernel/userspace/userspace.c, kernel/mempool.c), >5y → T_age=3, and the
+      allocator/userspace paths are actively maintained, T_maintained=3;
+      T=min(3,3)=3. (Shallow clone — T_age from 2017 feature history, not
+      per-file git log.)
+  C7d.1:
+    P:
+    D: 0
+    S: 0
+    A: 0
+    T_age:
+    T_maintained:
+    implementation:
+      config_options: []
+      source_files: []
+      default_state:
+    commits: []
+    discussions: []
+    rationale: |
+      N/A — the evaluated ARMv8-M Cortex-M33 baseline is a single-core MCU with
+      no shared last-level cache across isolation domains, so there is no
+      microarchitectural timing-channel surface to partition: cache colouring /
+      flush-on-switch / CAT-style allocation have nothing to act on. The
+      framework's applicability rules explicitly list Zephyr (with the other
+      single-core cacheless/SLC MCU targets) as N/A for C7d.1. This differs from OpenBSD,
+      which scores P=0 because its server-class hardware DOES have a shared LLC
+      (surface exists, mechanism absent); on Cortex-M the surface itself is
+      absent. Same N/A basis as the C7a/C7b/C7c speculative entries in this
+      file (no vulnerable shared microarchitectural state on this core).
